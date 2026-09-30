@@ -83,7 +83,8 @@ In a branch ruleset (or classic branch protection) for your default branch:
 
 - **Require status checks to pass** → add `pr-quiz`. This is the gate that reliably blocks merging.
 - Optionally **Require a pull request before merging** with 1 required approval. The bot's approval counts,
-  and its *Changes requested* review blocks while a quiz is pending.
+  and its *Changes requested* review blocks while a quiz is pending. Because the bot's approval counts, require
+  N + 1 approvals if you want N human approvals, or set `submit-reviews: false`.
 
 ### Custom bot identity (optional)
 
@@ -116,8 +117,13 @@ App approvals do not need the setting from step 3. Edits made by an App token tr
   shows the correct answers and explanations.
 - To take a quiz without approving first, comment `/pr-quiz`. This is also how quizzes work on pull
   requests from forks (see [Limitations](#limitations)).
+- The PR author and anyone who authored or committed one of its commits can't take the quiz; their
+  approvals neither pass nor block the gate.
 - If new commits change the code after you passed, and your approval is still active, you get a short
   follow-up quiz about the files that changed. A rebase that doesn't change the diff keeps your pass.
+- Changes a quiz can't cover (ignored files like lockfiles, binary files, diffs too large for GitHub to show)
+  never pass silently. Once you passed, such a change only needs you to approve the latest commit again; a PR
+  consisting only of such changes needs an approval of its latest commit instead of a quiz.
 
 ## Configuration
 
@@ -153,12 +159,19 @@ Every run also writes a job summary.
   reconciliation against GitHub's current state: reviews, quiz comments, the diff. Missed, duplicated or
   reordered webhook events can't desync it, and a failed run is simply retried by the next event.
 - **Secret answer key.** Each quiz comment carries its state (questions, correct answers, explanations,
-  reviewer, attempt, diff fingerprint) in an HTML comment, encrypted with AES-256-GCM and bound to the
-  repository and pull request. Reading the comment's source reveals nothing, and a blob can't be edited,
-  forged, or copied from another PR.
+  reviewer, attempt history, diff fingerprints) in an HTML comment, encrypted with AES-256-GCM and bound to
+  the repository, the pull request and the comment itself. Reading the comment's source reveals nothing,
+  and a blob can't be edited, forged, or copied into another comment or PR.
+- **No replays.** GitHub keeps every revision of a comment, including the open version of a quiz whose
+  answers were later revealed. Before touching an open quiz, the bot checks that its state is exactly the one
+  in the bot's own latest revision of that comment; pasted or rolled-back state is undone, and a quiz whose
+  history was pruned is closed without reusing its questions.
 - **Only the reviewer's ticks count.** Ticking a checkbox edits the comment, and GitHub records who made
   each edit. At submission, the bot reads the comment's edit history and rejects the quiz if anyone other
   than the reviewer or the bot edited it.
+- **History you can't delete away.** Every new quiz carries the reviewer's failed-attempt count and the
+  questions they have already seen, so deleting old quiz comments neither resets `max-attempts` nor brings
+  back questions whose answers were shown.
 - **Questions worth answering.** Claude is asked for questions about behavior, edge cases, risks and
   intent-vs-implementation, with plausible distractors of the same length and detail as the right answer.
   The bot shuffles the options itself, so the model can't be steered into a predictable answer position.
@@ -168,9 +181,11 @@ Every run also writes a job summary.
   with all tools disabled, in an empty directory, with a minimal environment.
 - **New commits.** The diff fingerprint ignores hunk line numbers, so rebases keep passes. Real changes make
   open quizzes outdated; approvers with an active approval get a follow-up quiz about the changed files.
-- **Refusals.** On the API path with Claude Opus 5.5, server-side fallbacks (`fallbacks: "default"`) retry a
-  request that a safety classifier declined (for example security-heavy code) on Anthropic's recommended
-  fallback model.
+  Retargeting the PR to another base branch is re-evaluated the same way.
+- **Refusals and errors.** On the API path with Claude Opus 5.5, server-side fallbacks (`fallbacks: "default"`)
+  retry a request that a safety classifier declined (for example security-heavy code) on Anthropic's
+  recommended fallback model. If generating a quiz still fails, the status shows the error and the bot
+  retries on the next approval, push or `/pr-quiz`, not on every checkbox tick.
 
 ## Cost
 
@@ -186,9 +201,15 @@ use `model: claude-sonnet-5-5`, `effort: medium`, or `verify-questions: false`.
 - **Pull requests from forks:** review events from forks run without secrets or write access, so an approval
   there doesn't start a quiz. Reviewers comment `/pr-quiz` instead (comment events always run in the base
   repository). Pushes to fork PRs are handled normally via `pull_request_target`.
-- **Threat model.** PR Quiz enforces diligence for well-intentioned teams. Anyone with admin rights, or with
-  write access who changes workflow files, can bypass CI gates, including this one. To harden it, protect
-  `.github/workflows/**` with CODEOWNERS and a ruleset, and use a dedicated GitHub App as the bot.
+- **Threat model.** The anti-cheat measures cover reviewers and authors acting through GitHub with their own
+  accounts: ticking someone else's quiz, pasting or rolling back quiz state, pruning edit history, deleting
+  old quizzes. They don't stop someone who can run workflows. With the default `GITHUB_TOKEN`, every workflow
+  in the repository acts as `github-actions[bot]`, the same identity as the quiz bot, and anyone with write
+  access can push a workflow that edits quiz comments as the bot or sets the `pr-quiz` status directly. To
+  harden it: use a dedicated GitHub App as the bot (edits by other workflows then count as someone else's),
+  select that App as the required source of the `pr-quiz` check in your ruleset, and protect
+  `.github/workflows/**` with CODEOWNERS and a ruleset so workflow changes need review.
+- Deleting every quiz comment of a reviewer resets their attempt history; deleting only some doesn't.
 - An LLM can still write a flawed question. The blind verification pass catches most of these, the graded
   quiz shows the explanation, and a failed attempt only costs a new set of questions.
 - GitHub lists at most 3000 files per PR; very large PRs are quizzed on what fits into `max-diff-chars`.
