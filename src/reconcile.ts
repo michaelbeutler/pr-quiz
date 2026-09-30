@@ -63,6 +63,16 @@ const MAX_CONTEXT_FILE_CHARS = 60_000;
 
 const key = (login: string) => login.replace(/\[bot\]$/i, '').toLowerCase();
 
+/** Why GitHub refused a review by the bot, in words that point at the fix. */
+function reviewRefusal(error: unknown): string {
+  const message = (error as Error).message;
+  if (/own pull request/i.test(message)) return `${message}. GitHub does not let the bot review a pull request it opened itself.`;
+  if (/not permitted/i.test(message)) {
+    return `${message}. For GITHUB_TOKEN, enable "Allow GitHub Actions to create and approve pull requests" in the repository (and organization) settings.`;
+  }
+  return message;
+}
+
 function listLogins(logins: string[]): string {
   const m = logins.map(mention);
   return m.length <= 1 ? (m[0] ?? '') : `${m.slice(0, -1).join(', ')} and ${m[m.length - 1]}`;
@@ -827,9 +837,7 @@ class Reconciliation {
         await this.gh.createReview(this.prNumber, 'APPROVE', body, sha);
         this.record('bot-approved', `Approved on behalf of ${listLogins(passers)}.`);
       } catch (error) {
-        log.warning(
-          `The bot could not approve (${(error as Error).message}). For GITHUB_TOKEN, enable "Allow GitHub Actions to create and approve pull requests" in the repository (and organization) settings. The commit status still reports the result.`,
-        );
+        log.warning(`The bot could not approve: ${reviewRefusal(error)} The commit status still reports the result.`);
         if (latest?.state === 'CHANGES_REQUESTED') await this.dismissBotReview(latest, 'PR Quiz passed.');
       }
       return;
@@ -844,7 +852,7 @@ class Reconciliation {
         await this.gh.createReview(this.prNumber, 'REQUEST_CHANGES', body, sha);
         this.record('bot-requested-changes', 'Blocking until the quiz is passed.');
       } catch (error) {
-        log.warning(`The bot could not submit its pending review: ${(error as Error).message}`);
+        log.warning(`The bot could not submit its pending review: ${reviewRefusal(error)}`);
       }
       return;
     }

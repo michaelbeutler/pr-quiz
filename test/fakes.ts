@@ -172,6 +172,10 @@ export class FakeGitHub implements GitHubApi {
     return structuredClone({ ...comment, edits: undefined }) as IssueComment;
   }
   async createReview(_pr: number, event: ReviewEvent, body: string, commitId: string): Promise<Review> {
+    if (event !== 'COMMENT' && loginsEqual(this.pr.user?.login, this.botLogin)) {
+      const verb = event === 'APPROVE' ? 'approve' : 'request changes on';
+      throw new GitHubError(`Review Can not ${verb} your own pull request`, 422);
+    }
     if (event === 'APPROVE' && !this.botMayApprove) {
       throw new GitHubError('GitHub Actions is not permitted to approve pull requests.', 422);
     }

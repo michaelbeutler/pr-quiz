@@ -4,6 +4,7 @@ import { LlmError } from '../src/llm/backend.ts';
 import { StateCodec } from '../src/quiz/crypto.ts';
 import { readCheckboxes } from '../src/quiz/parse.ts';
 import { reconcile, type Trigger } from '../src/reconcile.ts';
+import { log } from '../src/util/action.ts';
 import { FakeGitHub, FakeLlm, pickRight, pickWrongFirst, sampleFiles, testConfig } from './fakes.ts';
 
 function setup(config: Partial<Config> = {}) {
@@ -398,6 +399,24 @@ describe('degraded permissions and failures', () => {
     const quiz2 = gh.latestQuizFor('alice')!;
     expect(quiz2.id).not.toBe(quiz1.id);
     expect(gh.comments.find((c) => c.id === quiz1.id)!.body).toContain(quiz2.html_url);
+  });
+
+  it('still gates a pull request the bot opened itself, and says why it cannot review it', async () => {
+    // The live test setup: github-actions[bot] opened the PR, a human reviews.
+    const gh = new FakeGitHub({ author: 'github-actions[bot]' });
+    gh.committers = new Set(['pr-quiz-demo']);
+    const llm = new FakeLlm();
+    const config = testConfig();
+    const warnings = vi.spyOn(log, 'warning');
+    const run = () => reconcile({ gh, codec: new StateCodec(config.stateSecret, 4242), config, llm }, 7, { kind: 'manual' });
+    gh.approve('michaelbeutler');
+    await run();
+    gh.answerQuiz('michaelbeutler', gh.latestQuizFor('michaelbeutler')!.id, pickRight);
+    expect((await run()).gate).toBe('passed');
+    expect(gh.botReviewState()).toBeUndefined();
+    const messages = warnings.mock.calls.map(([m]) => m);
+    expect(messages).toContainEqual(expect.stringContaining('does not let the bot review a pull request it opened itself'));
+    expect(messages.join('\n')).not.toContain('Allow GitHub Actions');
   });
 
   it('works with a GitHub App bot identity', async () => {
