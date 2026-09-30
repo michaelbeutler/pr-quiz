@@ -1,0 +1,98 @@
+import { describe, expect, it } from 'vitest';
+import { ConfigError, readConfig } from '../src/config.ts';
+import { isCommand, parseEvent } from '../src/event.ts';
+
+const repository = { id: 1, full_name: 'acme/shop' };
+
+describe('parseEvent', () => {
+  it('turns an approval into an approval trigger', () => {
+    const parsed = parseEvent(
+      'pull_request_review',
+      {
+        action: 'submitted',
+        repository,
+        pull_request: { number: 7, head: { repo: { full_name: 'acme/shop' } } },
+        review: { state: 'approved', user: { login: 'alice', type: 'User' } },
+      },
+      '/pr-quiz',
+    );
+    expect(parsed).toEqual({ prNumber: 7, trigger: { kind: 'approval', actor: 'alice' } });
+  });
+
+  it('skips reviews on fork pull requests and points to the command', () => {
+    const parsed = parseEvent(
+      'pull_request_review',
+      {
+        action: 'submitted',
+        repository,
+        pull_request: { number: 7, head: { repo: { full_name: 'someone/shop' } } },
+        review: { state: 'approved', user: { login: 'alice', type: 'User' } },
+      },
+      '/pr-quiz',
+    );
+    expect(parsed.skipReason).toContain('/pr-quiz');
+  });
+
+  it('recognizes quiz edits and commands, and ignores other comments', () => {
+    const base = { repository, issue: { number: 7, pull_request: {} }, sender: { login: 'alice', type: 'User' } };
+    expect(parseEvent('issue_comment', { ...base, action: 'edited', comment: { body: '<!-- pr-quiz:quiz -->' } }, '/pr-quiz').trigger).toEqual({
+      kind: 'comment-edit',
+      actor: 'alice',
+    });
+    expect(
+      parseEvent('issue_comment', { ...base, action: 'created', comment: { id: 5, body: '/pr-quiz please', user: { login: 'bob' } } }, '/pr-quiz')
+        .trigger,
+    ).toEqual({ kind: 'command', actor: 'bob', commandCommentId: 5 });
+    expect(parseEvent('issue_comment', { ...base, action: 'created', comment: { body: 'nice work' } }, '/pr-quiz').skipReason).toBeDefined();
+    expect(
+      parseEvent('issue_comment', { ...base, sender: { login: 'x[bot]', type: 'Bot' }, action: 'edited', comment: { body: '<!-- pr-quiz:quiz -->' } }, '/pr-quiz')
+        .skipReason,
+    ).toBeDefined();
+    expect(parseEvent('issue_comment', { action: 'created', issue: { number: 3 }, comment: { body: '/pr-quiz' } }, '/pr-quiz').skipReason).toBeDefined();
+  });
+
+  it('treats pushes as reconcile triggers', () => {
+    expect(parseEvent('pull_request_target', { pull_request: { number: 9 }, sender: { login: 'dev' } }, '/pr-quiz')).toEqual({
+      prNumber: 9,
+      trigger: { kind: 'push', actor: 'dev' },
+    });
+  });
+
+  it('matches commands case-insensitively and as a whole word', () => {
+    expect(isCommand('/PR-QUIZ', '/pr-quiz')).toBe(true);
+    expect(isCommand('  /pr-quiz\nthanks', '/pr-quiz')).toBe(true);
+    expect(isCommand('/pr-quizzes', '/pr-quiz')).toBe(false);
+    expect(isCommand('please /pr-quiz', '/pr-quiz')).toBe(false);
+  });
+});
+
+describe('readConfig', () => {
+  const inputs = (values: Record<string, string>) => (name: string) => values[name] ?? '';
+
+  it('requires a Claude credential', () => {
+    expect(() => readConfig(inputs({ 'github-token': 't' }))).toThrow(ConfigError);
+  });
+
+  it('applies defaults and derives the state secret from the credential', () => {
+    const config = readConfig(inputs({ 'github-token': 't', 'claude-code-oauth-token': 'oauth', 'ignore-paths': 'docs/**, *.md' }));
+    expect(config).toMatchObject({
+      model: 'claude-opus-5-5',
+      effort: 'high',
+      questionCount: 3,
+      optionCount: 4,
+      requireAllApprovers: true,
+      maxAttempts: 5,
+      stateSecret: 'oauth',
+      statusContext: 'pr-quiz',
+    });
+    expect(config.ignorePaths).toContain('docs/**');
+    expect(config.ignorePaths).toContain('**/package-lock.json');
+  });
+
+  it('validates numbers and booleans', () => {
+    expect(() => readConfig(inputs({ 'github-token': 't', 'anthropic-api-key': 'k', questions: '0' }))).toThrow(/between 1 and 10/);
+    expect(() => readConfig(inputs({ 'github-token': 't', 'anthropic-api-key': 'k', 'verify-questions': 'maybe' }))).toThrow(
+      /true or false/,
+    );
+  });
+});
