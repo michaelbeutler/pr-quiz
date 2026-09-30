@@ -2,6 +2,7 @@
   "name": "pr-quiz",
   "version": "1.0.0",
   "private": true,
+  "license": "MIT",
   "description": "GitHub Action that quizzes PR approvers with AI-generated multiple-choice questions and only lets the approval count once every answer is correct.",
   "type": "module",
   "engines": {
