@@ -1,31 +1,55 @@
+<div align="center">
+
+<a href="docs/media/pr-quiz-demo.mp4"><img src="docs/media/pr-quiz-demo.gif" width="800" alt="PR Quiz demo: a reviewer approves with LGTM, the bot posts a quiz, a wrong answer dismisses the approval, new questions appear, the right answers turn the pr-quiz check green"></a>
+
 # PR Quiz
 
-**Approvals that prove understanding.** When someone approves a pull request, PR Quiz posts a short
-multiple-choice quiz about the change, written by Claude from the diff. The approval only counts once the
-reviewer ticks the right answers. Wrong answers dismiss the approval and bring a fresh set of questions.
+**Approvals that prove understanding.**
 
-Much code is now written by AI, and a quick "LGTM" is often the only human check. PR Quiz makes sure the
-human in the loop actually read and understood what they approved.
+A GitHub Action that won't let an approval count until the reviewer passes a short quiz<br>
+that Claude writes about the diff. One wrong answer and the approval is dismissed.
 
-## The flow
+[![CI](https://github.com/michaelbeutler/pr-quiz/actions/workflows/ci.yml/badge.svg)](https://github.com/michaelbeutler/pr-quiz/actions/workflows/ci.yml)
+[![GitHub Action](https://img.shields.io/badge/GitHub-Action-2088FF?logo=githubactions&logoColor=white)](action.yml)
+[![Questions by Claude](https://img.shields.io/badge/questions%20by-Claude-a371f7)](#2-connect-claude)
+![Node 24](https://img.shields.io/badge/node-24-3fb950?logo=nodedotjs&logoColor=white)
 
-1. Someone opens a pull request and asks **@alice** for a review.
-2. @alice reviews the code.
-3. @alice approves.
-4. The bot posts a quiz for @alice (GitHub checkboxes, one answer per question plus **Submit answers**) and
-   submits a **Changes requested** review, so it shows up in the reviewer list as blocking. The `pr-quiz`
-   commit status is `pending`.
-5. @alice ticks her answers and **Submit answers**. One is wrong.
-6. The bot dismisses @alice's approval and re-requests her review. The graded quiz shows which answers were
-   wrong, with explanations.
-7. The bot posts new questions (Claude is told not to repeat the old ones).
-8. @alice answers everything correctly.
-9. The bot **approves** on her behalf and `pr-quiz` turns green.
+[**▶ Watch the demo with sound**](docs/media/pr-quiz-demo.mp4) · [Quick start](#quick-start) · [How it works](#how-it-works) · [Configuration](#configuration)
 
-Run `npm run simulate` to watch this exact sequence against an in-memory GitHub and see every comment the
-bot writes.
+</div>
 
-What the quiz looks like to the reviewer:
+---
+
+AI writes more of our code every day, and a quick **LGTM** is often the only human check it gets.
+PR Quiz makes that check count: when someone approves a pull request, a bot posts a few multiple-choice
+questions about what the change actually does. The approval only counts once the reviewer ticks the right
+answers.
+
+## See it in action
+
+<table>
+  <tr>
+    <td width="50%"><img src="docs/images/1-approve.jpg" alt="The reviewer types LGTM and approves"></td>
+    <td width="50%"><img src="docs/images/2-quiz.jpg" alt="The bot posts a quiz with checkbox answers"></td>
+  </tr>
+  <tr>
+    <td><b>1. The usual.</b> The reviewer skims, types "LGTM" and approves.</td>
+    <td><b>2. The quiz.</b> The bot posts questions Claude wrote from the diff. The <code>pr-quiz</code> check waits.</td>
+  </tr>
+  <tr>
+    <td><img src="docs/images/3-dismissed.jpg" alt="A wrong answer dismisses the approval"></td>
+    <td><img src="docs/images/4-passed.jpg" alt="All answers right: the quiz passes and the check turns green"></td>
+  </tr>
+  <tr>
+    <td><b>3. One wrong answer.</b> The approval is dismissed, the review re-requested, and the right answer explained.</td>
+    <td><b>4. New questions, right answers.</b> The bot approves and <code>pr-quiz</code> turns green.</td>
+  </tr>
+</table>
+
+<sub>Frames from the demo video. The questions are the ones Claude generated in a real test run on this repository; the reviewer's name is a stand-in.</sub>
+
+<details>
+<summary>What the quiz comment looks like in Markdown</summary>
 
 ```markdown
 ## 🧠 PR Quiz for @alice
@@ -47,10 +71,56 @@ gets a 408 response every time. How many attempts does ky make, and why?
 - [ ] **Submit answers**
 ```
 
-(A real question Claude generated for [sindresorhus/ky#867](https://github.com/sindresorhus/ky/pull/867);
-`npm run smoke -- sindresorhus/ky 867` reproduces it.)
+A real question Claude generated for [sindresorhus/ky#867](https://github.com/sindresorhus/ky/pull/867);
+`npm run smoke -- sindresorhus/ky 867` reproduces it.
 
-## Setup
+</details>
+
+## The flow
+
+```mermaid
+sequenceDiagram
+    actor Author
+    actor Reviewer as Reviewer (@alice)
+    participant PR as Pull request
+    participant Bot as PR Quiz
+    participant Claude
+    Author->>PR: opens the PR, requests a review from @alice
+    Reviewer->>PR: approves ("LGTM")
+    PR->>Bot: review submitted
+    Bot->>Claude: diff + context
+    Claude-->>Bot: questions, checked by a blind second pass
+    Bot->>PR: posts the quiz, requests changes, pr-quiz pending
+    Reviewer->>PR: ticks answers + Submit (one wrong)
+    Bot->>PR: dismisses the approval, re-requests the review
+    Bot->>Claude: new questions (no repeats)
+    Bot->>PR: posts the new quiz
+    Reviewer->>PR: ticks answers + Submit (all right)
+    Bot->>PR: approves, pr-quiz turns green
+```
+
+<details>
+<summary>The same flow, step by step</summary>
+
+1. Someone opens a pull request and asks **@alice** for a review.
+2. @alice reviews the code.
+3. @alice approves.
+4. The bot posts a quiz for @alice (GitHub checkboxes, one answer per question plus **Submit answers**) and
+   submits a **Changes requested** review, so it shows up in the reviewer list as blocking. The `pr-quiz`
+   commit status is `pending`.
+5. @alice ticks their answers and **Submit answers**. One is wrong.
+6. The bot dismisses @alice's approval and re-requests their review. The graded quiz shows which answers were
+   wrong, with explanations.
+7. The bot posts new questions (Claude is told not to repeat the old ones).
+8. @alice answers everything correctly.
+9. The bot **approves** on their behalf and `pr-quiz` turns green.
+
+Run `npm run simulate` to watch this exact sequence against an in-memory GitHub and see every comment the
+bot writes.
+
+</details>
+
+## Quick start
 
 ### 1. Add the workflow
 
@@ -86,7 +156,8 @@ In a branch ruleset (or classic branch protection) for your default branch:
   and its *Changes requested* review blocks while a quiz is pending. Because the bot's approval counts, require
   N + 1 approvals if you want N human approvals, or set `submit-reviews: false`.
 
-### Custom bot identity (optional)
+<details>
+<summary>Optional: give the bot its own name with a GitHub App</summary>
 
 To have the bot appear as e.g. `pr-quiz[bot]` instead of `github-actions[bot]`, create a GitHub App with
 *Pull requests*, *Issues* and *Commit statuses* read/write and *Contents* read-only permissions, install it on
@@ -106,7 +177,10 @@ the repository, and pass its token:
 ```
 
 App approvals do not need the setting from step 3. Edits made by an App token trigger workflows; the job's
-`sender.type != 'Bot'` filter and the idempotent design keep that from looping.
+`sender.type != 'Bot'` filter and the idempotent design keep that from looping. A dedicated App is also the
+first step of the hardening described under [Limitations](#limitations).
+
+</details>
 
 ## For reviewers
 
@@ -197,7 +271,8 @@ use `model: claude-sonnet-5-5`, `effort: medium`, or `verify-questions: false`.
 ## Limitations
 
 - **Bots can't be requested reviewers on GitHub.** The bot therefore shows up in the reviewer list through
-  its own *Changes requested* review ("pending") and later its *Approve* review.
+  its own *Changes requested* review ("pending") and later its *Approve* review. GitHub also doesn't let the
+  bot review a pull request it opened itself; the `pr-quiz` status still gates those.
 - **Pull requests from forks:** review events from forks run without secrets or write access, so an approval
   there doesn't start a quiz. Reviewers comment `/pr-quiz` instead (comment events always run in the base
   repository). Pushes to fork PRs are handled normally via `pull_request_target`.
@@ -236,3 +311,8 @@ git tag v1.0.0 && git tag -f v1 && git push origin v1.0.0 v1 --force
 ```
 
 Consumers then use `uses: michaelbeutler/pr-quiz@v1`.
+
+---
+
+<sub>Demo video made with <a href="https://hyperframes.heygen.com">HyperFrames</a>.
+Music: "Happy Beats / Business Moves Vol. 1" by <a href="https://ende.app/en">ende.app</a>.</sub>
