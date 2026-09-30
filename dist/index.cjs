@@ -19084,7 +19084,7 @@ function letter(index) {
 function mention(login) {
   return `@${login}`;
 }
-var CODE_SPAN = /(?<!`)(`+)(?!`)[\s\S]*?[^`]\1(?!`)/g;
+var CODE_SPAN = /(?<![`\\])(`+)(?!`)[\s\S]*?[^`]\1(?!`)/g;
 function escapeHtmlOutsideCode(text) {
   const escape2 = (s) => s.replace(/</g, "&lt;").replace(/>/g, "&gt;");
   let out = "";
@@ -19107,6 +19107,9 @@ function extractSealedState(body) {
 }
 function isQuizBody(body) {
   return !!body && body.includes(QUIZ_MARKER) && STATE_RE.test(body);
+}
+function renderPlaceholder(reviewer) {
+  return `\u23F3 Preparing a PR Quiz for ${mention(reviewer)}\u2026`;
 }
 function shortSha(sha) {
   return sha.slice(0, 7);
@@ -19279,7 +19282,7 @@ function parseEvent(eventName, raw, command2) {
           skipReason: `review events on pull requests from forks run without secrets or write access. The reviewer can comment "${command2}" to take the quiz instead.`
         };
       }
-      if (payload.review?.user?.type === "Bot") return { prNumber, skipReason: "the review was submitted by a bot." };
+      if (payload.sender?.type === "Bot") return { prNumber, skipReason: "the review event was caused by a bot." };
       const approved = payload.action === "submitted" && payload.review?.state?.toLowerCase() === "approved";
       return { prNumber, trigger: { kind: approved ? "approval" : "review", actor: payload.review?.user?.login } };
     }
@@ -19329,6 +19332,7 @@ function loginsEqual(a, b) {
 
 // src/github/client.ts
 var MAX_RETRIES = 3;
+var MAX_EDIT_PAGES = 20;
 var RestGitHub = class {
   opts;
   apiUrl;
@@ -19482,43 +19486,56 @@ var RestGitHub = class {
     const query = `query($id: ID!, $after: String) {
       node(id: $id) {
         ... on IssueComment {
-          userContentEdits(first: 100, after: $after) {
+          userContentEdits(first: 50, after: $after) {
             pageInfo { hasNextPage endCursor }
-            nodes { editedAt editor { login __typename } }
+            nodes { editedAt deletedAt diff editor { login __typename } }
           }
         }
       }
     }`;
     const edits = [];
     let after = null;
-    for (let page = 0; page < 10; page++) {
+    for (let page = 0; page < MAX_EDIT_PAGES; page++) {
       const data = await this.graphql(query, { id: commentNodeId, after });
       const connection = data.node?.userContentEdits;
-      if (!connection) break;
+      if (!connection) return { edits, complete: true };
       for (const node of connection.nodes) {
         if (!node) continue;
         edits.push({
           editor: node.editor ? node.editor.login.replace(/\[bot\]$/i, "") : null,
           isBot: node.editor?.__typename === "Bot",
-          editedAt: node.editedAt
+          editedAt: node.editedAt,
+          body: node.deletedAt ? null : node.diff
         });
       }
-      if (!connection.pageInfo.hasNextPage) break;
+      if (!connection.pageInfo.hasNextPage) return { edits, complete: true };
       after = connection.pageInfo.endCursor;
     }
-    return edits;
+    return { edits, complete: false };
   }
-  async getPermission(login) {
+  async hasWriteAccess(login) {
     try {
       const { data } = await this.request(
         "GET",
         `${this.repoPath}/collaborators/${encodeURIComponent(login)}/permission`
       );
-      return data.role_name || data.permission || "none";
+      return data.user?.permissions?.push ?? (data.permission === "admin" || data.permission === "write");
     } catch (error) {
-      if (error instanceof GitHubError && error.status === 404) return "none";
+      if (error instanceof GitHubError && error.status === 404) return false;
       throw error;
     }
+  }
+  async listCommitters(pr) {
+    const commits = await this.paginate(
+      `${this.repoPath}/pulls/${pr}/commits`,
+      3
+    );
+    const logins = /* @__PURE__ */ new Set();
+    for (const commit of commits) {
+      if (commit.author?.login) logins.add(commit.author.login);
+      if (commit.committer?.login) logins.add(commit.committer.login);
+    }
+    return [...logins];
   }
   async addReaction(commentId, content) {
     await this.request("POST", `${this.repoPath}/issues/comments/${commentId}/reactions`, { content });
@@ -19841,12 +19858,23 @@ function fileFingerprint(file) {
   const content = file.patch !== void 0 ? normalizePatch(file.patch) : `blob:${file.sha ?? ""}`;
   return sha256(`${file.status}\0${file.previous_filename ?? ""}\0${content}`).slice(0, 16);
 }
+function hashEntries(entries) {
+  return sha256(
+    entries.map(([path4, fp]) => `${path4}\0${fp}`).sort().join("\n")
+  ).slice(0, 32);
+}
+function isReadable(file) {
+  return !!file.patch && file.patch.trim() !== "";
+}
 function buildChangeSet(files, ignoreGlobs) {
   const isIgnored = (0, import_picomatch.default)([...ignoreGlobs], { dot: true });
   const reviewable = [];
   const ignored = [];
+  const everything = [];
   for (const file of files) {
     if (file.status === "unchanged") continue;
+    const fingerprint = fileFingerprint(file);
+    everything.push([file.filename, fingerprint]);
     if (isIgnored(file.filename)) {
       ignored.push(file.filename);
       continue;
@@ -19858,25 +19886,23 @@ function buildChangeSet(files, ignoreGlobs) {
       additions: file.additions,
       deletions: file.deletions,
       patch: file.patch,
-      fingerprint: fileFingerprint(file)
+      fingerprint
     });
   }
-  const fileFingerprints = Object.fromEntries(reviewable.map((f) => [f.path, f.fingerprint]));
-  const fingerprint = sha256(
-    reviewable.map((f) => `${f.path}\0${f.fingerprint}`).sort().join("\n")
-  ).slice(0, 32);
+  const quizzable = reviewable.filter(isReadable).map((f) => [f.path, f.fingerprint]);
   return {
     files: reviewable,
     ignored,
-    fingerprint,
-    fileFingerprints,
-    hasReadableChanges: reviewable.some((f) => !!f.patch && f.patch.trim() !== ""),
+    fingerprint: hashEntries(quizzable),
+    fullFingerprint: hashEntries(everything),
+    fileFingerprints: Object.fromEntries(quizzable),
+    hasReadableChanges: quizzable.length > 0,
     possiblyIncomplete: files.length >= 3e3
   };
 }
 function changedSince(previous, current) {
   if (!previous) return null;
-  const changed = current.files.filter((f) => previous[f.path] !== f.fingerprint).map((f) => f.path);
+  const changed = Object.entries(current.fileFingerprints).filter(([path4, fp]) => previous[path4] !== fp).map(([path4]) => path4);
   const dropped = Object.keys(previous).filter((path4) => !(path4 in current.fileFingerprints));
   return [...changed, ...dropped];
 }
@@ -20124,15 +20150,12 @@ async function verify(backend, context, candidates, usage) {
   const answers = response.data?.answers;
   if (!Array.isArray(answers)) throw new LlmError('Verification returned no "answers" array.', true);
   const byId = new Map(answers.map((a) => [a.id, a]));
-  return candidates.filter((candidate, id) => {
+  const kept = candidates.filter((candidate, id) => {
     const verdict = byId.get(id);
-    const keep = !!verdict && verdict.valid && verdict.choice === candidate.question.answer;
-    if (!keep) {
-      const why = !verdict ? "no verdict" : !verdict.valid ? `invalid: ${verdict.issue}` : `verifier chose ${verdict.choice}`;
-      log.info(`Dropping question "${candidate.plain.question.slice(0, 80)}\u2026" (${why})`);
-    }
-    return keep;
+    return !!verdict && verdict.valid && verdict.choice === candidate.question.answer;
   });
+  log.info(`Verification kept ${kept.length} of ${candidates.length} candidate question(s).`);
+  return kept;
 }
 var MAX_ROUNDS = 2;
 async function generateQuiz(backend, input) {
@@ -20225,9 +20248,11 @@ function parseOpenQuiz(body, state, sealed) {
 }
 
 // src/reconcile.ts
-var WRITE_ROLES = /* @__PURE__ */ new Set(["admin", "maintain", "write"]);
 var TRUSTED_ASSOCIATIONS = /* @__PURE__ */ new Set(["OWNER", "MEMBER", "COLLABORATOR"]);
+var RETRY_TRIGGERS = /* @__PURE__ */ new Set(["approval", "command", "push", "manual"]);
+var GENERATION_ERROR_PREFIX = "Quiz error:";
 var MAX_STORED_FILE_FINGERPRINTS = 300;
+var MAX_ASKED_QUESTIONS = 30;
 var MAX_COMMENT_CHARS = 65e3;
 var MAX_CONTEXT_FILES = 15;
 var MAX_CONTEXT_FILE_CHARS = 6e4;
@@ -20238,11 +20263,18 @@ function listLogins(logins) {
 }
 var Reconciliation = class {
   actions = [];
+  /** Question generation failures. */
   errors = [];
+  /** Open quizzes that could not be verified this run (e.g. the edit history was unavailable). */
+  verificationErrors = [];
   deps;
   prNumber;
   trigger;
-  permissionCache = /* @__PURE__ */ new Map();
+  eligibility = /* @__PURE__ */ new Map();
+  committers = /* @__PURE__ */ new Set();
+  previousStatus = null;
+  /** Generation was skipped because an earlier attempt failed and this trigger is not a retry. */
+  generationPaused = false;
   pr;
   reviews = [];
   quizzes = [];
@@ -20270,24 +20302,35 @@ var Reconciliation = class {
     if (this.pr.state !== "open") {
       return { gate: "skipped", description: "Pull request is not open.", actions: this.actions };
     }
-    if (this.trigger.kind === "command" && this.trigger.commandCommentId) {
-      await this.react(this.trigger.commandCommentId, "eyes");
-    }
-    const [reviews, comments, files] = await Promise.all([
+    if (this.trigger.kind === "command") await this.react(this.trigger.commandCommentId, "eyes");
+    const [reviews, comments, files, committers, previousStatus] = await Promise.all([
       this.gh.listReviews(this.prNumber),
       this.gh.listComments(this.prNumber),
-      this.gh.listFiles(this.prNumber)
+      this.gh.listFiles(this.prNumber),
+      this.gh.listCommitters(this.prNumber).catch((error) => {
+        log.warning(`Could not list the pull request's commit authors: ${error.message}`);
+        return [];
+      }),
+      this.gh.getStatus(this.pr.head.sha, this.config.statusContext).catch(() => null)
     ]);
     this.reviews = reviews;
+    this.committers = new Set(committers.map(key));
+    this.previousStatus = previousStatus;
     this.changes = buildChangeSet(files, this.config.ignorePaths);
-    this.quizzes = this.loadQuizzes(comments);
+    this.quizzes = await this.loadQuizzes(comments);
     if (this.changes.possiblyIncomplete) log.warning("GitHub lists at most 3000 files; the quiz only sees those.");
     for (const quiz of [...this.quizzes]) {
       if (quiz.state.status === "open") await this.processOpenQuiz(quiz);
     }
-    if (this.changes.hasReadableChanges) await this.ensureQuizzes();
+    if (this.changes.hasReadableChanges) {
+      await this.ensureQuizzes();
+    } else if (this.trigger.kind === "command") {
+      await this.react(this.trigger.commandCommentId, "confused");
+    }
     await this.linkFollowUps();
-    const gate = this.evaluateGate();
+    await this.resolveEligibility();
+    let gate = this.evaluateGate();
+    if (this.generationPaused && gate.state !== "success" && this.previousStatus) gate = this.previousStatus;
     await this.publishStatus(gate);
     if (this.config.submitReviews) await this.syncBotReview(gate.state === "success");
     return {
@@ -20297,7 +20340,18 @@ var Reconciliation = class {
     };
   }
   // --- Loading -----------------------------------------------------------------------------------------------
-  loadQuizzes(comments) {
+  toQuiz(comment, state) {
+    return {
+      commentId: comment.id,
+      nodeId: comment.node_id,
+      url: comment.html_url,
+      body: comment.body,
+      createdAt: comment.created_at,
+      author: comment.user?.login ?? "",
+      state
+    };
+  }
+  async loadQuizzes(comments) {
     const quizzes = [];
     for (const comment of comments) {
       if (comment.user?.type !== "Bot" || !isQuizBody(comment.body)) continue;
@@ -20306,48 +20360,86 @@ var Reconciliation = class {
         log.info(`Ignoring quiz comment ${comment.id}: its state cannot be decrypted with the current secret.`);
         continue;
       }
-      quizzes.push({
-        commentId: comment.id,
-        nodeId: comment.node_id,
-        url: comment.html_url,
-        body: comment.body,
-        createdAt: comment.created_at,
-        author: comment.user.login,
-        state
-      });
+      if (state.commentId === comment.id) {
+        quizzes.push(this.toQuiz(comment, state));
+        continue;
+      }
+      const recovered = await this.recoverOwnState(comment);
+      if (recovered) quizzes.push(recovered);
+      else log.warning(`Ignoring comment ${comment.id}: it carries quiz state that belongs to another comment.`);
     }
     return quizzes.sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.commentId - b.commentId);
+  }
+  /** Restores a quiz comment to the state in the bot's own latest revision of it. */
+  async recoverOwnState(comment) {
+    const history = await this.gh.getCommentEdits(comment.node_id).catch(() => null);
+    if (!history?.complete) return null;
+    const ours = history.edits.find((e) => e.editor && loginsEqual(e.editor, comment.user?.login));
+    const sealed = ours?.body ? extractSealedState(ours.body) : null;
+    const state = sealed ? this.deps.codec.open(this.prNumber, sealed) : null;
+    if (!state || state.commentId !== comment.id) return null;
+    const quiz = this.toQuiz(comment, state);
+    const culprits = history.edits.filter((e) => !(e.editor && loginsEqual(e.editor, comment.user?.login)));
+    const who = [...new Set(culprits.map((e) => `\`${e.editor ?? "ghost"}\``))].join(", ") || "someone";
+    if (state.status === "open") state.notice = `This quiz was modified by ${who}, so it was restored. Please select your answers again.`;
+    await this.save(quiz);
+    this.record("quiz-restored", `Undid quiz state pasted into comment ${comment.id} by ${who.replace(/`/g, "")}.`);
+    return quiz;
   }
   quizzesOf(login) {
     return this.quizzes.filter((q) => loginsEqual(q.state.reviewer, login));
   }
-  validPass(login) {
-    return this.quizzesOf(login).find((q) => q.state.status === "passed" && q.state.fingerprint === this.changes.fingerprint);
+  /** Latest review decision of a user; comments don't change a decision on GitHub. */
+  latestDecision(login) {
+    return this.reviews.filter((r) => r.user && loginsEqual(r.user.login, login) && r.state !== "COMMENTED" && r.state !== "PENDING").at(-1);
+  }
+  approvedLatestCommit(login) {
+    const decision = this.latestDecision(login);
+    return decision?.state === "APPROVED" && decision.commit_id === this.pr.head.sha;
+  }
+  /**
+   * A pass is valid for the code the quiz covered. If only ignored or binary files changed since (which a quiz
+   * can't cover), the reviewer must approve the latest commit again for the pass to keep counting.
+   */
+  passStatus(login) {
+    const quiz = this.quizzesOf(login).filter((q) => q.state.status === "passed" && q.state.fingerprint === this.changes.fingerprint).at(-1);
+    if (!quiz) return { status: "none" };
+    if (quiz.state.fullFingerprint === this.changes.fullFingerprint || this.approvedLatestCommit(login)) {
+      return { status: "valid", quiz };
+    }
+    return { status: "needs-approval", quiz };
+  }
+  /** Passes that count: valid, by an eligible reviewer who has not requested changes since. */
+  passes() {
+    const byReviewer = /* @__PURE__ */ new Map();
+    for (const quiz of this.quizzes) {
+      const login = quiz.state.reviewer;
+      if (byReviewer.has(key(login)) || this.eligibility.get(key(login)) !== true) continue;
+      const pass = this.passStatus(login);
+      if (pass.status !== "valid" || this.latestDecision(login)?.state === "CHANGES_REQUESTED") continue;
+      byReviewer.set(key(login), pass.quiz);
+    }
+    return [...byReviewer.values()];
   }
   openQuiz(login) {
     return this.quizzesOf(login).find((q) => q.state.status === "open" && q.state.fingerprint === this.changes.fingerprint);
   }
-  /** Latest review decision of a user; comments don't change a decision on GitHub. */
-  latestDecision(login) {
-    return this.reviews.filter(
-      (r) => r.user && loginsEqual(r.user.login, login) && r.state !== "COMMENTED" && r.state !== "PENDING"
-    ).at(-1)?.state;
-  }
-  /** One valid passed quiz per reviewer, ignoring reviewers who have since requested changes. */
-  passes() {
-    const byReviewer = /* @__PURE__ */ new Map();
-    for (const quiz of this.quizzes) {
-      if (quiz.state.status !== "passed" || quiz.state.fingerprint !== this.changes.fingerprint) continue;
-      if (this.latestDecision(quiz.state.reviewer) === "CHANGES_REQUESTED") continue;
-      byReviewer.set(key(quiz.state.reviewer), quiz);
-    }
-    return [...byReviewer.values()];
-  }
   openQuizzes() {
     return this.quizzes.filter((q) => q.state.status === "open" && q.state.fingerprint === this.changes.fingerprint);
   }
-  failedCount(login) {
-    return this.quizzesOf(login).filter((q) => q.state.status === "failed").length;
+  /**
+   * Failed attempts and questions seen so far. Every quiz carries this history forward in its sealed state, so
+   * deleting old quiz comments neither resets the attempt limit nor brings back questions whose answers were shown.
+   */
+  attemptHistory(login) {
+    const mine = this.quizzesOf(login);
+    let failed = mine.filter((q) => q.state.status === "failed").length;
+    const asked = [];
+    for (const quiz of mine) {
+      failed = Math.max(failed, (quiz.state.failedBefore ?? 0) + (quiz.state.status === "failed" ? 1 : 0));
+      asked.push(...quiz.state.asked ?? [], ...quiz.state.questions.map((q) => q.text.slice(0, 200)));
+    }
+    return { failed, asked: [...new Set(asked)].slice(-MAX_ASKED_QUESTIONS) };
   }
   /** Humans whose latest review decision is an approval. */
   activeApprovers() {
@@ -20357,7 +20449,30 @@ var Reconciliation = class {
       if (review.state === "COMMENTED" || review.state === "PENDING") continue;
       latest.set(key(review.user.login), review);
     }
-    return [...latest.values()].filter((r) => r.state === "APPROVED" && !loginsEqual(r.user.login, this.pr.user?.login)).map((r) => r.user.login);
+    return [...latest.values()].filter((r) => r.state === "APPROVED").map((r) => r.user.login);
+  }
+  // --- Eligibility ---------------------------------------------------------------------------------------------
+  /** Who may take a quiz (and so be approved for): not an author of the change, and able to push. */
+  async isEligible(login) {
+    const cached = this.eligibility.get(key(login));
+    if (cached !== void 0) return cached;
+    let eligible = false;
+    if (!loginsEqual(login, this.pr.user?.login) && !this.committers.has(key(login))) {
+      try {
+        eligible = await this.gh.hasWriteAccess(login);
+      } catch (error) {
+        log.warning(`Could not read ${login}'s permission (${error.message}); falling back to author association.`);
+        eligible = this.reviews.some(
+          (r) => r.user && loginsEqual(r.user.login, login) && TRUSTED_ASSOCIATIONS.has(r.author_association ?? "")
+        );
+      }
+    }
+    this.eligibility.set(key(login), eligible);
+    return eligible;
+  }
+  async resolveEligibility() {
+    const logins = /* @__PURE__ */ new Set([...this.activeApprovers(), ...this.quizzes.map((q) => q.state.reviewer)]);
+    for (const login of logins) await this.isEligible(login);
   }
   // --- Writing quizzes -----------------------------------------------------------------------------------------
   /** Seals and renders; drops the optional per-file fingerprints if the comment would exceed GitHub's size limit. */
@@ -20372,15 +20487,18 @@ var Reconciliation = class {
     const updated = await this.gh.updateComment(quiz.commentId, body);
     quiz.body = updated.body ?? body;
   }
+  /** Posts a placeholder first so the state can be sealed together with the id of the comment it lives in. */
   async post(state) {
-    const comment = await this.gh.createComment(this.prNumber, this.render(state));
+    const placeholder = await this.gh.createComment(this.prNumber, renderPlaceholder(state.reviewer));
+    state.commentId = placeholder.id;
+    const comment = await this.gh.updateComment(placeholder.id, this.render(state));
     const quiz = {
-      commentId: comment.id,
-      nodeId: comment.node_id,
-      url: comment.html_url,
+      commentId: placeholder.id,
+      nodeId: placeholder.node_id,
+      url: placeholder.html_url,
       body: comment.body,
-      createdAt: comment.created_at,
-      author: comment.user?.login ?? "",
+      createdAt: placeholder.created_at,
+      author: placeholder.user?.login ?? "",
       state
     };
     this.quizzes.push(quiz);
@@ -20401,6 +20519,19 @@ var Reconciliation = class {
   }
   // --- Open quizzes --------------------------------------------------------------------------------------------
   async processOpenQuiz(quiz) {
+    let history;
+    try {
+      history = await this.gh.getCommentEdits(quiz.nodeId);
+    } catch (error) {
+      this.verificationErrors.push(error.message);
+      log.warning(`Could not read the edit history of quiz comment ${quiz.commentId}: ${error.message}`);
+      return;
+    }
+    const integrity = this.checkIntegrity(quiz, history);
+    if (!integrity.ok) {
+      await this.handleTampering(quiz, integrity);
+      return;
+    }
     const { state } = quiz;
     const who = mention(state.reviewer);
     if (state.fingerprint !== this.changes.fingerprint) {
@@ -20410,7 +20541,7 @@ var Reconciliation = class {
       return;
     }
     const duplicate = this.quizzesOf(state.reviewer).find(
-      (q) => q !== quiz && q.state.status === "open" && q.createdAt > quiz.createdAt
+      (q) => q !== quiz && q.state.status === "open" && q.commentId > quiz.commentId
     );
     if (duplicate) {
       state.status = "outdated";
@@ -20428,15 +20559,7 @@ var Reconciliation = class {
       return;
     }
     if (!parsed.submitted) return;
-    let intruders;
-    try {
-      intruders = await this.findIntruders(quiz);
-    } catch (error) {
-      state.notice = "Could not verify who ticked the answers (GitHub API error). Untick and tick **Submit answers** to try again.";
-      await this.save(quiz, parsed.selections, false);
-      this.errors.push(`Could not read the quiz edit history: ${error.message}`);
-      return;
-    }
+    const intruders = this.intruders(quiz, history);
     if (intruders.length) {
       await this.voidAndRepost(quiz, intruders);
       return;
@@ -20450,6 +20573,7 @@ var Reconciliation = class {
     }
     state.notice = void 0;
     state.result = { answers: result.answers, correct: result.correct, gradedAt: this.now() };
+    state.fullFingerprint = this.changes.fullFingerprint;
     const right = result.correct.filter(Boolean).length;
     if (result.passed) {
       state.status = "passed";
@@ -20462,11 +20586,47 @@ var Reconciliation = class {
     await this.save(quiz);
     this.record("quiz-failed", `${who} answered ${right}/${state.questions.length} correctly.`);
   }
+  /**
+   * The state blob must be exactly the one in the bot's own latest revision of the comment. This catches pasting
+   * an older version of a quiz (e.g. the open version of one whose answers were revealed after grading), moving
+   * state between comments, and pruning the bot's revisions from the edit history.
+   */
+  checkIntegrity(quiz, history) {
+    const culprits = [
+      ...new Set(
+        history.edits.filter((e) => !(e.editor && loginsEqual(e.editor, quiz.author))).map((e) => e.editor ?? "ghost")
+      )
+    ];
+    if (!history.complete) return { ok: false, culprits };
+    if (history.edits.length === 0) return { ok: true };
+    const ours = history.edits.find((e) => e.editor && loginsEqual(e.editor, quiz.author));
+    if (!ours?.body) return { ok: false, culprits };
+    const ourSealed = extractSealedState(ours.body);
+    if (ourSealed && ourSealed === extractSealedState(quiz.body)) return { ok: true };
+    const restore = ourSealed ? this.deps.codec.open(this.prNumber, ourSealed) : null;
+    return restore && restore.commentId === quiz.commentId ? { ok: false, restore, culprits } : { ok: false, culprits };
+  }
+  async handleTampering(quiz, integrity) {
+    const who = integrity.culprits.map((l) => `\`${l}\``).join(", ") || "someone";
+    if (integrity.restore) {
+      quiz.state = integrity.restore;
+      if (quiz.state.status === "open") {
+        quiz.state.notice = `This quiz was modified by ${who}, so it was restored. Please select your answers again.`;
+      }
+      await this.save(quiz);
+      this.record("quiz-restored", `Undid changes by ${integrity.culprits.join(", ") || "unknown"} to the quiz state.`);
+      return;
+    }
+    quiz.state.status = "void";
+    quiz.state.voidedBy = integrity.culprits;
+    quiz.state.closedReason = `The edit history of this quiz was altered (by ${who}), so it can no longer be graded. A new quiz with new questions is posted when needed.`;
+    await this.save(quiz);
+    this.record("quiz-voided", `Quiz for ${mention(quiz.state.reviewer)} had its history altered.`);
+  }
   /** Everyone except the reviewer and the bot who edited the quiz comment (checkbox ticks are edits). */
-  async findIntruders(quiz) {
-    const edits = await this.gh.getCommentEdits(quiz.nodeId);
+  intruders(quiz, history) {
     const intruders = /* @__PURE__ */ new Set();
-    for (const edit of edits) {
+    for (const edit of history.edits) {
       if (edit.editor && (loginsEqual(edit.editor, quiz.state.reviewer) || loginsEqual(edit.editor, quiz.author))) continue;
       intruders.add(edit.editor ?? "ghost");
     }
@@ -20481,11 +20641,9 @@ var Reconciliation = class {
       createdAt: this.now(),
       notice: `The previous copy of this quiz was edited by ${intruders.map((l) => `\`${l}\``).join(", ")}. Only ${mention(old.reviewer)} may answer, so the answers were reset.`
     };
-    delete fresh.result;
-    delete fresh.voidedBy;
-    delete fresh.followUpUrl;
-    delete fresh.closingNotes;
-    delete fresh.closedReason;
+    for (const field of ["commentId", "result", "voidedBy", "followUpUrl", "closingNotes", "closedReason"]) {
+      delete fresh[field];
+    }
     const replacement = await this.post(fresh);
     old.status = "void";
     old.voidedBy = intruders;
@@ -20527,22 +20685,6 @@ var Reconciliation = class {
     return notes;
   }
   // --- Creating quizzes ----------------------------------------------------------------------------------------
-  async canTakeQuiz(login) {
-    if (loginsEqual(login, this.pr.user?.login)) return false;
-    const cached = this.permissionCache.get(key(login));
-    if (cached !== void 0) return cached;
-    let allowed;
-    try {
-      allowed = WRITE_ROLES.has(await this.gh.getPermission(login));
-    } catch (error) {
-      log.warning(`Could not read ${login}'s permission (${error.message}); falling back to author association.`);
-      allowed = this.reviews.some(
-        (r) => r.user && loginsEqual(r.user.login, login) && TRUSTED_ASSOCIATIONS.has(r.author_association ?? "")
-      );
-    }
-    this.permissionCache.set(key(login), allowed);
-    return allowed;
-  }
   async ensureQuizzes() {
     const candidates = /* @__PURE__ */ new Map();
     for (const login of this.activeApprovers()) candidates.set(key(login), login);
@@ -20555,18 +20697,28 @@ var Reconciliation = class {
     for (const login of candidates.values()) {
       const who = mention(login);
       const isCommander = !!commander && loginsEqual(login, commander);
-      if (this.validPass(login) || this.openQuiz(login)) {
+      if (this.passStatus(login).status !== "none" || this.openQuiz(login)) {
         if (isCommander) await this.react(this.trigger.commandCommentId, "+1");
         continue;
       }
-      if (!await this.canTakeQuiz(login)) {
-        this.record("quiz-skipped", `${who} cannot take the quiz (pull request author or no write access).`);
+      if (!await this.isEligible(login)) {
+        const why = `${who} cannot take the quiz (an author of the change, or no write access).`;
+        if (isCommander) {
+          this.record("quiz-skipped", why);
+          await this.react(this.trigger.commandCommentId, "confused");
+        } else {
+          log.info(why);
+        }
+        continue;
+      }
+      if (this.config.maxAttempts > 0 && this.attemptHistory(login).failed >= this.config.maxAttempts) {
+        await this.lockOut(login);
         if (isCommander) await this.react(this.trigger.commandCommentId, "confused");
         continue;
       }
-      if (this.config.maxAttempts > 0 && this.failedCount(login) >= this.config.maxAttempts) {
-        await this.lockOut(login);
-        if (isCommander) await this.react(this.trigger.commandCommentId, "confused");
+      if (this.previousStatus?.state === "error" && this.previousStatus.description.startsWith(GENERATION_ERROR_PREFIX) && !RETRY_TRIGGERS.has(this.trigger.kind)) {
+        this.generationPaused = true;
+        log.info(`Not retrying quiz generation for ${login} on a ${this.trigger.kind} event after an earlier error.`);
         continue;
       }
       try {
@@ -20601,8 +20753,8 @@ var Reconciliation = class {
     if (last && !last.state.closingNotes?.includes(note)) {
       last.state.closingNotes = [...last.state.closingNotes ?? [], note];
       await this.save(last);
+      this.record("attempts-exhausted", note);
     }
-    this.record("attempts-exhausted", note);
   }
   async fetchFileContext(onlyPaths) {
     const contents = /* @__PURE__ */ new Map();
@@ -20640,12 +20792,13 @@ var Reconciliation = class {
         `Diff exceeds max-diff-chars: truncated ${context.truncatedPaths.length} and omitted ${context.omittedPaths.length} file(s).`
       );
     }
+    const history = this.attemptHistory(login);
     const generated = await generateQuiz(this.deps.llm, {
       context: context.text,
       reviewer: login,
       questionCount: this.config.questionCount,
       optionCount: this.config.optionCount,
-      previousQuestions: this.quizzesOf(login).flatMap((q) => q.state.questions.map((x) => x.text)),
+      previousQuestions: history.asked,
       incremental,
       extraInstructions: this.config.extraInstructions,
       verify: this.config.verifyQuestions
@@ -20655,7 +20808,9 @@ var Reconciliation = class {
       v: 1,
       id: (0, import_node_crypto5.randomBytes)(8).toString("hex"),
       reviewer: login,
-      attempt: this.failedCount(login) + 1,
+      attempt: history.failed + 1,
+      failedBefore: history.failed,
+      asked: history.asked,
       headSha: this.pr.head.sha,
       fingerprint: this.changes.fingerprint,
       files: fileCount <= MAX_STORED_FILE_FINGERPRINTS ? this.changes.fileFingerprints : void 0,
@@ -20675,11 +20830,13 @@ var Reconciliation = class {
   // --- Gate, status and bot review -----------------------------------------------------------------------------
   evaluateGate() {
     const context = this.config.statusContext;
+    const eligibleApprovers = this.activeApprovers().filter((login) => this.eligibility.get(key(login)) === true);
     if (!this.changes.hasReadableChanges) {
-      return { state: "success", context, description: "No reviewable changes (only ignored or binary files)." };
+      const approvers = eligibleApprovers.filter((login) => this.approvedLatestCommit(login));
+      return approvers.length ? { state: "success", context, description: `No readable diff to quiz on; approved by ${listLogins(approvers)}` } : { state: "pending", context, description: "No readable diff to quiz on; waiting for an approval of the latest commit" };
     }
     const passers = this.passes();
-    const pendingApprovers = this.activeApprovers().filter((login) => !this.validPass(login));
+    const pendingApprovers = eligibleApprovers.filter((login) => this.passStatus(login).status !== "valid");
     const open = this.openQuizzes();
     const satisfied = passers.length > 0 && (!this.config.requireAllApprovers || pendingApprovers.length === 0);
     if (satisfied) {
@@ -20691,7 +20848,20 @@ var Reconciliation = class {
       };
     }
     if (this.errors.length) {
-      return { state: "error", context, description: `Quiz error: ${this.errors[0]}`, target_url: this.pr.html_url };
+      return {
+        state: "error",
+        context,
+        description: `${GENERATION_ERROR_PREFIX} ${this.errors[0]}. Comment ${this.config.command} to retry.`,
+        target_url: this.pr.html_url
+      };
+    }
+    if (this.verificationErrors.length) {
+      return {
+        state: "error",
+        context,
+        description: "Could not verify a quiz (GitHub API error); it is checked again on the next event.",
+        target_url: this.pr.html_url
+      };
     }
     if (open.length) {
       return {
@@ -20699,6 +20869,17 @@ var Reconciliation = class {
         context,
         description: `Waiting for ${listLogins(open.map((q) => q.state.reviewer))} to answer the quiz`,
         target_url: open[0].url
+      };
+    }
+    const reapprove = [...new Set(this.quizzes.map((q) => q.state.reviewer))].filter(
+      (login) => this.eligibility.get(key(login)) === true && this.passStatus(login).status === "needs-approval"
+    );
+    if (reapprove.length) {
+      return {
+        state: "pending",
+        context,
+        description: `Ignored or binary files changed since ${listLogins(reapprove)} passed; approve the latest commit to confirm`,
+        target_url: this.pr.html_url
       };
     }
     if (pendingApprovers.length) {
@@ -20717,7 +20898,7 @@ var Reconciliation = class {
     };
   }
   async publishStatus(status) {
-    const current = await this.gh.getStatus(this.pr.head.sha, status.context).catch(() => null);
+    const current = this.previousStatus;
     const description = status.description.length > 140 ? status.description.slice(0, 139) + "\u2026" : status.description;
     if (current && current.state === status.state && current.description === description && (current.target_url ?? "") === (status.target_url ?? "")) {
       return;
@@ -20733,7 +20914,7 @@ var Reconciliation = class {
     const passers = this.passes().map((q) => q.state.reviewer);
     const sha = this.pr.head.sha;
     if (satisfied && passers.length === 0) {
-      if (latest?.state === "CHANGES_REQUESTED") await this.dismissBotReview(latest, "PR Quiz: no reviewable changes.");
+      if (latest?.state === "CHANGES_REQUESTED") await this.dismissBotReview(latest, "PR Quiz: no readable diff to quiz on.");
       return;
     }
     if (satisfied) {
@@ -20767,7 +20948,7 @@ ${links}`;
       return;
     }
     if (!open.length && latest?.state === "APPROVED") {
-      await this.dismissBotReview(latest, "PR Quiz: the code changed since the quiz was passed.");
+      await this.dismissBotReview(latest, "PR Quiz: the approval is no longer backed by a passed quiz.");
     }
   }
   async dismissBotReview(review, message) {
