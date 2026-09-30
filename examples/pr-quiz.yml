@@ -1,0 +1,50 @@
+# Copy to .github/workflows/pr-quiz.yml in the repository you want to protect,
+# then mark the "pr-quiz" status as required (see README).
+name: PR Quiz
+
+on:
+  # An approval (or a dismissal by someone else) starts or re-evaluates a quiz.
+  pull_request_review:
+    types: [submitted, dismissed]
+  # New commits make open quizzes outdated and may require a follow-up quiz.
+  # pull_request_target runs this workflow from the base branch; the action never checks out PR code.
+  pull_request_target:
+    types: [opened, reopened, synchronize, ready_for_review]
+  # Ticking checkboxes edits the quiz comment; "/pr-quiz" requests a quiz without approving first.
+  issue_comment:
+    types: [created, edited]
+
+permissions:
+  contents: read
+  pull-requests: write # comment, review, dismiss approvals, re-request reviews
+  issues: write # edit quiz comments
+  statuses: write # the "pr-quiz" commit status
+
+jobs:
+  quiz:
+    # Skip ordinary PR discussion, events caused by bots (except pushes), and Dependabot runs, which get
+    # neither secrets nor write access (a human approval of a Dependabot PR still starts the quiz).
+    if: >-
+      github.actor != 'dependabot[bot]' &&
+      (github.event.sender.type != 'Bot' || github.event_name == 'pull_request_target') &&
+      (github.event_name != 'issue_comment' || (
+        github.event.issue.pull_request &&
+        (contains(github.event.comment.body, '<!-- pr-quiz:quiz -->') || startsWith(github.event.comment.body, '/pr-quiz'))
+      ))
+    runs-on: ubuntu-latest
+    # One run per pull request at a time, so quizzes are never generated twice.
+    concurrency:
+      group: pr-quiz-${{ github.event.pull_request.number || github.event.issue.number }}
+      cancel-in-progress: false
+    steps:
+      - uses: your-org/pr-quiz@v1
+        with:
+          # Connect Claude with one of these two secrets:
+          #   CLAUDE_CODE_OAUTH_TOKEN: your Claude subscription (`claude setup-token`)
+          #   ANTHROPIC_API_KEY:       an Anthropic API key (used when both are set)
+          claude-code-oauth-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          # questions: 3
+          # model: claude-opus-5-5
+          # require-all-approvers: true
+          # extra-instructions: Focus on security and data handling.
