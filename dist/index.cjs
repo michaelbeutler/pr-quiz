@@ -20257,6 +20257,14 @@ var MAX_COMMENT_CHARS = 65e3;
 var MAX_CONTEXT_FILES = 15;
 var MAX_CONTEXT_FILE_CHARS = 6e4;
 var key = (login) => login.replace(/\[bot\]$/i, "").toLowerCase();
+function reviewRefusal(error) {
+  const message = error.message;
+  if (/own pull request/i.test(message)) return `${message}. GitHub does not let the bot review a pull request it opened itself.`;
+  if (/not permitted/i.test(message)) {
+    return `${message}. For GITHUB_TOKEN, enable "Allow GitHub Actions to create and approve pull requests" in the repository (and organization) settings.`;
+  }
+  return message;
+}
 function listLogins(logins) {
   const m = logins.map(mention);
   return m.length <= 1 ? m[0] ?? "" : `${m.slice(0, -1).join(", ")} and ${m[m.length - 1]}`;
@@ -20925,9 +20933,7 @@ var Reconciliation = class {
         await this.gh.createReview(this.prNumber, "APPROVE", body, sha);
         this.record("bot-approved", `Approved on behalf of ${listLogins(passers)}.`);
       } catch (error) {
-        log.warning(
-          `The bot could not approve (${error.message}). For GITHUB_TOKEN, enable "Allow GitHub Actions to create and approve pull requests" in the repository (and organization) settings. The commit status still reports the result.`
-        );
+        log.warning(`The bot could not approve: ${reviewRefusal(error)} The commit status still reports the result.`);
         if (latest?.state === "CHANGES_REQUESTED") await this.dismissBotReview(latest, "PR Quiz passed.");
       }
       return;
@@ -20943,7 +20949,7 @@ ${links}`;
         await this.gh.createReview(this.prNumber, "REQUEST_CHANGES", body, sha);
         this.record("bot-requested-changes", "Blocking until the quiz is passed.");
       } catch (error) {
-        log.warning(`The bot could not submit its pending review: ${error.message}`);
+        log.warning(`The bot could not submit its pending review: ${reviewRefusal(error)}`);
       }
       return;
     }
