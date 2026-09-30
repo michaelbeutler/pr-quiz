@@ -1,8 +1,6 @@
-name: PR Quiz
-description: >-
-  Quizzes pull request approvers with Claude-generated multiple-choice questions about the change.
-  An approval only counts once every question is answered correctly.
-author: pr-quiz
+name: PR Quiz Gate
+description: Quizzes PR approvers on the diff with questions Claude writes. An approval only counts once every answer is right.
+author: Michael Beutler
 branding:
   icon: help-circle
   color: purple
