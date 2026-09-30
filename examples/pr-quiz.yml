@@ -6,10 +6,10 @@ on:
   # An approval (or a dismissal by someone else) starts or re-evaluates a quiz.
   pull_request_review:
     types: [submitted, dismissed]
-  # New commits make open quizzes outdated and may require a follow-up quiz.
+  # New commits (or a new base branch, via "edited") make open quizzes outdated and may need a follow-up quiz.
   # pull_request_target runs this workflow from the base branch; the action never checks out PR code.
   pull_request_target:
-    types: [opened, reopened, synchronize, ready_for_review]
+    types: [opened, reopened, synchronize, ready_for_review, edited]
   # Ticking checkboxes edits the quiz comment; "/pr-quiz" requests a quiz without approving first.
   issue_comment:
     types: [created, edited]
