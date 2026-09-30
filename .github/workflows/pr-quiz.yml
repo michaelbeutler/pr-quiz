@@ -1,0 +1,41 @@
+# Dogfooding: runs this repository's own action (from the default branch) on its pull requests.
+# Consumers should copy examples/pr-quiz.yml instead.
+name: PR Quiz
+
+on:
+  pull_request_review:
+    types: [submitted, dismissed]
+  pull_request_target:
+    types: [opened, reopened, synchronize, ready_for_review]
+  issue_comment:
+    types: [created, edited]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  statuses: write
+
+jobs:
+  quiz:
+    if: >-
+      github.actor != 'dependabot[bot]' &&
+      (github.event.sender.type != 'Bot' || github.event_name == 'pull_request_target') &&
+      (github.event_name != 'issue_comment' || (
+        github.event.issue.pull_request &&
+        (contains(github.event.comment.body, '<!-- pr-quiz:quiz -->') || startsWith(github.event.comment.body, '/pr-quiz'))
+      ))
+    runs-on: ubuntu-latest
+    concurrency:
+      group: pr-quiz-${{ github.event.pull_request.number || github.event.issue.number }}
+      cancel-in-progress: false
+    steps:
+      # Always run the action code from the default branch, never from the pull request under review.
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - uses: ./
+        with:
+          claude-code-oauth-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
