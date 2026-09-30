@@ -1,0 +1,29 @@
+{
+  "name": "pr-quiz",
+  "version": "1.0.0",
+  "private": true,
+  "description": "GitHub Action that quizzes PR approvers with AI-generated multiple-choice questions and only lets the approval count once every answer is correct.",
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "build": "esbuild src/main.ts --bundle --platform=node --target=node24 --format=cjs --outfile=dist/index.cjs --legal-comments=eof --log-level=warning",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "simulate": "node scripts/simulate.ts",
+    "smoke": "node scripts/smoke-generate.ts",
+    "all": "npm run typecheck && npm test && npm run build"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.129.0",
+    "picomatch": "^4.0.7"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/picomatch": "^4.0.0",
+    "esbuild": "^0.28.2",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.3"
+  }
+}
