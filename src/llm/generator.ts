@@ -219,15 +219,14 @@ async function verify(
   const answers = (response.data as { answers?: VerificationVerdict[] })?.answers;
   if (!Array.isArray(answers)) throw new LlmError('Verification returned no "answers" array.', true);
   const byId = new Map(answers.map((a) => [a.id, a]));
-  return candidates.filter((candidate, id) => {
+  const kept = candidates.filter((candidate, id) => {
     const verdict = byId.get(id);
-    const keep = !!verdict && verdict.valid && verdict.choice === candidate.question.answer;
-    if (!keep) {
-      const why = !verdict ? 'no verdict' : !verdict.valid ? `invalid: ${verdict.issue}` : `verifier chose ${verdict.choice}`;
-      log.info(`Dropping question "${candidate.plain.question.slice(0, 80)}…" (${why})`);
-    }
-    return keep;
+    return !!verdict && verdict.valid && verdict.choice === candidate.question.answer;
   });
+  // Only counts: workflow logs are readable by everyone with access to the repository, and a dropped question
+  // may still be used as a fallback, so the verifier's choices must not appear there.
+  log.info(`Verification kept ${kept.length} of ${candidates.length} candidate question(s).`);
+  return kept;
 }
 
 const MAX_ROUNDS = 2;
