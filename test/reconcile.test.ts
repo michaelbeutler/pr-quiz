@@ -166,7 +166,7 @@ describe('answer integrity', () => {
     expect(stored.body).toContain('The quiz text was changed, so it was restored.');
   });
 
-  it('does not grade when the edit history cannot be read', async () => {
+  it('does not grade when the edit history cannot be read, and grades on the next event', async () => {
     const { gh, run } = setup();
     gh.approve('alice');
     await run();
@@ -175,10 +175,10 @@ describe('answer integrity', () => {
     gh.failEditHistory = true;
     const result = await run();
     expect(result.gate).toBe('error');
-    expect(gh.comments.find((c) => c.id === quiz.id)!.body).toContain('Could not verify who ticked the answers');
+    expect(gh.latestStatus()?.description).toContain('Could not verify a quiz');
+    expect(gh.bodyOf(quiz.id)).toContain('## 🧠 PR Quiz for @alice'); // untouched, still submitted
     gh.failEditHistory = false;
-    gh.toggleCheckbox('alice', quiz.id, 12); // tick submit again
-    expect((await run()).gate).toBe('passed');
+    expect((await run({ kind: 'comment-edit', actor: 'alice' })).gate).toBe('passed');
   });
 
   it('ignores quiz comments it cannot decrypt (e.g. forged by a user)', async () => {
@@ -308,22 +308,39 @@ describe('limits and permissions', () => {
     expect((await run()).gate).toBe('passed'); // a pass counts even without a formal approval
   });
 
-  it('does not quiz approvals from users without write access', async () => {
-    const { gh, run } = setup();
+  it('does not quiz approvals from users without write access, and they do not block the gate', async () => {
+    const { gh, run, llm } = setup();
     gh.permissions.set('drive-by', 'read');
     gh.approve('drive-by', 'NONE');
     const result = await run();
     expect(gh.latestQuizFor('drive-by')).toBeUndefined();
-    expect(result.actions.map((a) => a.type)).toContain('quiz-skipped');
+    expect(result.actions.map((a) => a.type)).not.toContain('quiz-posted');
+    expect(llm.requests).toHaveLength(0);
+
+    gh.approve('alice');
+    await run();
+    gh.answerQuiz('alice', gh.latestQuizFor('alice')!.id, pickRight);
+    expect((await run()).gate).toBe('passed'); // the drive-by approval can never pass, so it is ignored
   });
 
-  it('turns green without a quiz when only ignored files changed', async () => {
+  it('accepts a custom role with write access', async () => {
     const { gh, run } = setup();
+    gh.permissions.set('senior', 'senior-dev');
+    gh.approve('senior');
+    await run();
+    expect(gh.latestQuizFor('senior')).toBeDefined();
+  });
+
+  it('needs a plain approval of the latest commit when only ignored files changed', async () => {
+    const { gh, run, llm } = setup();
     gh.push([sampleFiles()[1]!]); // lockfile only
+    expect((await run({ kind: 'push' })).gate).toBe('pending');
+    expect(gh.latestStatus()?.description).toContain('No readable diff to quiz on');
     gh.approve('alice');
     expect((await run()).gate).toBe('passed');
     expect(gh.latestQuizFor('alice')).toBeUndefined();
-    expect(gh.latestStatus()?.description).toContain('No reviewable changes');
+    expect(llm.requests).toHaveLength(0);
+    expect(gh.latestStatus()?.description).toBe('No readable diff to quiz on; approved by @alice');
   });
 });
 
@@ -392,5 +409,224 @@ describe('degraded permissions and failures', () => {
     await run();
     gh.answerQuiz('alice', gh.latestQuizFor('alice')!.id, pickRight);
     expect((await run()).gate).toBe('passed');
+  });
+});
+
+describe('state integrity (replays and rollbacks)', () => {
+  /** Fails alice's first quiz after she saved its raw, still-open markdown. */
+  async function failFirstQuiz(ctx: ReturnType<typeof setup>) {
+    const { gh, run } = ctx;
+    gh.approve('alice');
+    await run();
+    const quiz1 = gh.latestQuizFor('alice')!;
+    const openBody = gh.bodyOf(quiz1.id); // visible to her in the edit history anyway
+    gh.answerQuiz('alice', quiz1.id, pickWrongFirst);
+    await run();
+    const graded = gh.bodyOf(quiz1.id);
+    expect(graded).toContain('not passed');
+    return { quiz1, openBody, quiz2: gh.latestQuizFor('alice')! };
+  }
+
+  /** Ticks the answers the graded quiz revealed, in a body that has Q1's open state. */
+  function tickRevealed(gh: FakeGitHub, commentId: number) {
+    gh.answerQuiz('alice', commentId, pickRight);
+  }
+
+  it('rejects pasting an earlier, answered quiz into the retake comment', async () => {
+    const ctx = setup();
+    const { gh, run } = ctx;
+    const { openBody, quiz2 } = await failFirstQuiz(ctx);
+
+    gh.editBody('alice', quiz2.id, openBody);
+    tickRevealed(gh, quiz2.id);
+    const result = await run({ kind: 'comment-edit', actor: 'alice' });
+
+    expect(result.gate).toBe('pending');
+    expect(result.actions.map((a) => a.type)).toContain('quiz-restored');
+    expect(result.actions.map((a) => a.type)).not.toContain('quiz-posted'); // her retake is back, no new generation
+    expect(gh.bodyOf(quiz2.id)).toContain('was modified by `alice`, so it was restored');
+    expect(gh.bodyOf(quiz2.id)).toContain('Set 2'); // the retake's own questions are back
+    expect(gh.botReviewState()).toBe('CHANGES_REQUESTED');
+  });
+
+  it('rejects rolling a graded quiz back to its open version', async () => {
+    const ctx = setup();
+    const { gh, run } = ctx;
+    const { quiz1, openBody } = await failFirstQuiz(ctx);
+
+    gh.editBody('alice', quiz1.id, openBody);
+    tickRevealed(gh, quiz1.id);
+    const result = await run({ kind: 'comment-edit', actor: 'alice' });
+
+    expect(result.gate).toBe('pending');
+    expect(gh.bodyOf(quiz1.id)).toContain('❌ PR Quiz not passed by @alice');
+  });
+
+  it('closes a quiz without reusing its questions when the bot revision was pruned from the history', async () => {
+    const ctx = setup();
+    const { gh, run, llm } = ctx;
+    const { quiz1, openBody } = await failFirstQuiz(ctx);
+
+    gh.editBody('alice', quiz1.id, openBody);
+    gh.pruneRevision(quiz1.id, (edit, index) => edit.isBot && index <= 2); // hide the graded revision
+    tickRevealed(gh, quiz1.id);
+    const generations = llm.generation;
+    const result = await run({ kind: 'comment-edit', actor: 'alice' });
+
+    expect(result.gate).toBe('pending');
+    expect(gh.bodyOf(quiz1.id)).toContain('edit history of this quiz was altered');
+    expect(llm.generation).toBe(generations); // her open retake stays; nothing regenerated from Q1
+  });
+
+  it('ignores quiz state copied into a comment posted by another workflow', async () => {
+    const { gh, run } = setup();
+    gh.approve('alice');
+    await run();
+    const quiz = gh.latestQuizFor('alice')!;
+    // Same github-actions identity, pre-ticked copy of alice's quiz (answers guessed).
+    const copy = gh.postAsBot(gh.bodyOf(quiz.id).replace(/- \[ \]/g, '- [x]'));
+    const result = await run();
+    expect(result.actions.map((a) => a.type)).not.toContain('quiz-failed');
+    expect(gh.bodyOf(copy.id)).toContain('- [x]'); // untouched and never graded
+    expect(gh.reviewStateOf('alice')).toBe('APPROVED');
+  });
+
+  it('with a GitHub App identity, edits made as github-actions count as someone else', async () => {
+    const gh = new FakeGitHub({ botLogin: 'pr-quiz[bot]' });
+    const llm = new FakeLlm();
+    const config = testConfig();
+    const run = () => reconcile({ gh, codec: new StateCodec(config.stateSecret, 4242), config, llm }, 7, { kind: 'manual' });
+    gh.approve('alice');
+    await run();
+    const quiz = gh.latestQuizFor('alice')!;
+    gh.toggleCheckbox('github-actions', quiz.id, 0);
+    gh.answerQuiz('alice', quiz.id, pickRight);
+    const result = await run();
+    expect(result.actions.map((a) => a.type)).toContain('quiz-voided');
+    expect(gh.bodyOf(quiz.id)).toContain('edited by `github-actions`');
+  });
+});
+
+describe('changes a quiz cannot cover', () => {
+  const binary = { filename: 'public/logo.png', status: 'added', additions: 0, deletions: 0, changes: 0, sha: 'img1' };
+
+  async function passedAlice(ctx: ReturnType<typeof setup>) {
+    ctx.gh.approve('alice');
+    await ctx.run();
+    ctx.gh.answerQuiz('alice', ctx.gh.latestQuizFor('alice')!.id, pickRight);
+    expect((await ctx.run()).gate).toBe('passed');
+  }
+
+  it('asks for a fresh approval, not a quiz, when only ignored files change after a pass', async () => {
+    const ctx = setup();
+    const { gh, run, llm } = ctx;
+    await passedAlice(ctx);
+    const generations = llm.generation;
+
+    const [code, lock] = sampleFiles();
+    gh.push([code!, { ...lock!, patch: '@@ -1 +1 @@\n-"lockfileVersion": 3\n+"evil": "https://attacker.example"\n' }]);
+    expect((await run({ kind: 'push' })).gate).toBe('pending');
+    expect(gh.latestStatus()?.description).toContain('approve the latest commit to confirm');
+    expect(llm.generation).toBe(generations);
+
+    gh.approve('alice');
+    expect((await run({ kind: 'approval', actor: 'alice' })).gate).toBe('passed');
+  });
+
+  it('does not generate a junk quiz when only a binary file is added after a pass', async () => {
+    const ctx = setup();
+    const { gh, run, llm } = ctx;
+    await passedAlice(ctx);
+    const generations = llm.generation;
+    gh.push([...sampleFiles(), binary]);
+    expect((await run({ kind: 'push' })).gate).toBe('pending');
+    expect(llm.generation).toBe(generations);
+  });
+
+  it('never turns green for a binary-only PR without an approval of the latest commit', async () => {
+    const { gh, run } = setup();
+    gh.push([binary]);
+    expect((await run({ kind: 'push' })).gate).toBe('pending');
+    gh.approve('alice');
+    expect((await run()).gate).toBe('passed');
+  });
+
+  it('re-evaluates when the base branch changes what the PR contains', async () => {
+    const ctx = setup();
+    const { gh, run } = ctx;
+    await passedAlice(ctx);
+    gh.retarget(sampleFiles(5), 'release');
+    const result = await run({ kind: 'push' });
+    expect(result.gate).toBe('pending');
+    expect(gh.latestStatus()?.state).toBe('pending');
+  });
+});
+
+describe('who may take the quiz', () => {
+  it('excludes people who committed to the pull request, and ignores their approvals', async () => {
+    const { gh, run } = setup();
+    gh.push(sampleFiles(2), 'bob'); // bob pushed a fix-up commit
+    gh.approve('bob');
+    const own = gh.say('bob', '/pr-quiz');
+    await run({ kind: 'command', actor: 'bob', commandCommentId: own.id });
+    expect(gh.latestQuizFor('bob')).toBeUndefined();
+    expect(gh.reactions).toContainEqual({ commentId: own.id, content: 'confused' });
+
+    gh.approve('alice');
+    await run();
+    gh.answerQuiz('alice', gh.latestQuizFor('alice')!.id, pickRight);
+    expect((await run()).gate).toBe('passed');
+  });
+
+  it('stops counting a pass when the reviewer later pushes to the pull request', async () => {
+    const { gh, run } = setup({ requireAllApprovers: false });
+    gh.approve('alice');
+    await run();
+    gh.answerQuiz('alice', gh.latestQuizFor('alice')!.id, pickRight);
+    await run();
+    gh.committers.add('alice'); // e.g. she pushed a commit without changing the diff we quiz on
+    expect((await run()).gate).toBe('pending');
+  });
+});
+
+describe('attempt history', () => {
+  it('survives deleting old quiz comments', async () => {
+    const { gh, run, llm } = setup({ maxAttempts: 3 });
+    gh.approve('alice');
+    await run();
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      gh.answerQuiz('alice', gh.latestQuizFor('alice')!.id, pickWrongFirst);
+      await run();
+    }
+    const third = gh.latestQuizFor('alice')!;
+    expect(third.body).toContain('Attempt 3');
+    // Delete the failed quizzes to "reset" the history.
+    gh.comments = gh.comments.filter((c) => c.id === third.id || !c.body.includes('not passed'));
+    gh.answerQuiz('alice', third.id, pickWrongFirst);
+    const result = await run();
+    expect(result.actions.map((a) => a.type)).toContain('attempts-exhausted');
+    const lastTask = llm.requests.findLast((r) => r.task.includes('Write '))!.task;
+    expect(lastTask).toContain('Set 1, question 1'); // earlier questions still reach the generator
+  });
+});
+
+describe('retrying after errors', () => {
+  it('does not call Claude again on every checkbox tick after a failure', async () => {
+    const { gh, run, llm } = setup();
+    llm.failGeneration = new LlmError('Claude declined to write questions for this change.', false);
+    gh.approve('alice');
+    await run({ kind: 'approval', actor: 'alice' });
+    const calls = llm.requests.length;
+    expect(gh.latestStatus()?.state).toBe('error');
+
+    await run({ kind: 'comment-edit', actor: 'bob' });
+    await run({ kind: 'review', actor: 'bob' });
+    expect(llm.requests.length).toBe(calls);
+    expect(gh.latestStatus()?.state).toBe('error');
+
+    llm.failGeneration = null;
+    const retry = gh.say('alice', '/pr-quiz');
+    await run({ kind: 'command', actor: 'alice', commandCommentId: retry.id });
+    expect(gh.latestQuizFor('alice')).toBeDefined();
   });
 });

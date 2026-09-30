@@ -124,6 +124,8 @@ describe('inlineText', () => {
     expect(inlineText('``oops` <!-- hide the rest', 400)).not.toContain('<!--');
     expect(inlineText('`a` and `<!-- x -->`', 400)).toBe('`a` and `<​!-- x -->`');
     expect(inlineText('``code with ` inside``', 400)).toBe('``code with ` inside``');
+    // An escaped backtick is literal, so what follows is not code and must be escaped.
+    expect(inlineText('\\`<img src=x onerror=alert(1)>`', 400)).not.toContain('<img');
   });
 
   it('truncates long text', () => {

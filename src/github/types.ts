@@ -55,6 +55,8 @@ export interface ContentEdit {
   editor: string | null;
   isBot: boolean;
   editedAt: string;
+  /** Full comment body of this revision; null when the revision's content was deleted. */
+  body: string | null;
 }
 
 export type CommitState = 'pending' | 'success' | 'failure' | 'error';
@@ -84,10 +86,18 @@ export interface GitHubApi {
   /** Most recent status with this context on the commit, if any. */
   getStatus(sha: string, context: string): Promise<CommitStatus | null>;
   /** Edit history of an issue comment, newest first (GitHub's order). */
-  getCommentEdits(commentNodeId: string): Promise<ContentEdit[]>;
-  /** 'admin' | 'maintain' | 'write' | 'triage' | 'read' | 'none' */
-  getPermission(login: string): Promise<string>;
+  getCommentEdits(commentNodeId: string): Promise<CommentHistory>;
+  /** Whether the user can push to the repository (admin, maintain, write or a custom role based on them). */
+  hasWriteAccess(login: string): Promise<boolean>;
+  /** GitHub users who authored or committed any commit of the pull request. */
+  listCommitters(pr: number): Promise<string[]>;
   addReaction(commentId: number, content: '+1' | 'eyes' | 'confused' | 'rocket'): Promise<void>;
+}
+
+export interface CommentHistory {
+  edits: ContentEdit[];
+  /** False when the history was too long to read completely. */
+  complete: boolean;
 }
 
 export class GitHubError extends Error {

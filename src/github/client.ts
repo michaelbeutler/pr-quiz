@@ -1,6 +1,7 @@
 import { setTimeout as sleep } from 'node:timers/promises';
 import {
   GitHubError,
+  type CommentHistory,
   type CommitStatus,
   type ContentEdit,
   type GitHubApi,
@@ -23,6 +24,8 @@ export interface RestGitHubOptions {
 }
 
 const MAX_RETRIES = 3;
+/** 20 pages of 50 revisions; longer histories are reported as incomplete. */
+const MAX_EDIT_PAGES = 20;
 
 /** Small fetch-based GitHub client (REST + GraphQL) with pagination and retries for transient errors. */
 export class RestGitHub implements GitHubApi {
@@ -206,13 +209,14 @@ export class RestGitHub implements GitHubApi {
       : null;
   }
 
-  async getCommentEdits(commentNodeId: string): Promise<ContentEdit[]> {
+  async getCommentEdits(commentNodeId: string): Promise<CommentHistory> {
+    // `diff` holds the full body of each revision (verified against GitHub), `deletedAt` marks pruned revisions.
     const query = `query($id: ID!, $after: String) {
       node(id: $id) {
         ... on IssueComment {
-          userContentEdits(first: 100, after: $after) {
+          userContentEdits(first: 50, after: $after) {
             pageInfo { hasNextPage endCursor }
-            nodes { editedAt editor { login __typename } }
+            nodes { editedAt deletedAt diff editor { login __typename } }
           }
         }
       }
@@ -221,41 +225,61 @@ export class RestGitHub implements GitHubApi {
       node: {
         userContentEdits?: {
           pageInfo: { hasNextPage: boolean; endCursor: string | null };
-          nodes: Array<{ editedAt: string; editor: { login: string; __typename: string } | null } | null>;
+          nodes: Array<{
+            editedAt: string;
+            deletedAt: string | null;
+            diff: string | null;
+            editor: { login: string; __typename: string } | null;
+          } | null>;
         };
       } | null;
     };
     const edits: ContentEdit[] = [];
     let after: string | null = null;
-    for (let page = 0; page < 10; page++) {
+    for (let page = 0; page < MAX_EDIT_PAGES; page++) {
       const data: Page = await this.graphql<Page>(query, { id: commentNodeId, after });
       const connection = data.node?.userContentEdits;
-      if (!connection) break;
+      if (!connection) return { edits, complete: true };
       for (const node of connection.nodes) {
         if (!node) continue;
         edits.push({
           editor: node.editor ? node.editor.login.replace(/\[bot\]$/i, '') : null,
           isBot: node.editor?.__typename === 'Bot',
           editedAt: node.editedAt,
+          body: node.deletedAt ? null : node.diff,
         });
       }
-      if (!connection.pageInfo.hasNextPage) break;
+      if (!connection.pageInfo.hasNextPage) return { edits, complete: true };
       after = connection.pageInfo.endCursor;
     }
-    return edits;
+    return { edits, complete: false };
   }
 
-  async getPermission(login: string): Promise<string> {
+  async hasWriteAccess(login: string): Promise<boolean> {
     try {
-      const { data } = await this.request<{ permission: string; role_name?: string }>(
+      const { data } = await this.request<{ permission?: string; user?: { permissions?: { push?: boolean } } }>(
         'GET',
         `${this.repoPath}/collaborators/${encodeURIComponent(login)}/permission`,
       );
-      return data.role_name || data.permission || 'none';
+      // `role_name` can be a custom role; `permission` / `permissions.push` reflect its base role.
+      return data.user?.permissions?.push ?? (data.permission === 'admin' || data.permission === 'write');
     } catch (error) {
-      if (error instanceof GitHubError && error.status === 404) return 'none';
+      if (error instanceof GitHubError && error.status === 404) return false;
       throw error;
     }
+  }
+
+  async listCommitters(pr: number): Promise<string[]> {
+    const commits = await this.paginate<{ author: { login: string } | null; committer: { login: string } | null }>(
+      `${this.repoPath}/pulls/${pr}/commits`,
+      3,
+    );
+    const logins = new Set<string>();
+    for (const commit of commits) {
+      if (commit.author?.login) logins.add(commit.author.login);
+      if (commit.committer?.login) logins.add(commit.committer.login);
+    }
+    return [...logins];
   }
 
   async addReaction(commentId: number, content: '+1' | 'eyes' | 'confused' | 'rocket'): Promise<void> {

@@ -14,12 +14,16 @@ export interface ReviewableFile {
 }
 
 export interface ChangeSet {
+  /** Changed files that are not ignored (with or without a readable diff). */
   files: ReviewableFile[];
   ignored: string[];
-  /** Hash over all reviewable changes; equal fingerprints mean the pull request changes the same things. */
+  /** Hash over the changes a quiz can cover: non-ignored files with a readable diff. */
   fingerprint: string;
+  /** Hash over every changed file, including ignored and binary ones, so no change goes unnoticed. */
+  fullFingerprint: string;
+  /** Per-file fingerprints of the files a quiz can cover. */
   fileFingerprints: Record<string, string>;
-  /** At least one reviewable file has a textual diff Claude can read. */
+  /** At least one non-ignored file has a textual diff Claude can read. */
   hasReadableChanges: boolean;
   /** GitHub lists at most 3000 files per pull request. */
   possiblyIncomplete: boolean;
@@ -40,12 +44,28 @@ export function fileFingerprint(file: PullFile): string {
   return sha256(`${file.status}\0${file.previous_filename ?? ''}\0${content}`).slice(0, 16);
 }
 
+function hashEntries(entries: Array<[string, string]>): string {
+  return sha256(
+    entries
+      .map(([path, fp]) => `${path}\0${fp}`)
+      .sort()
+      .join('\n'),
+  ).slice(0, 32);
+}
+
+export function isReadable(file: ReviewableFile): boolean {
+  return !!file.patch && file.patch.trim() !== '';
+}
+
 export function buildChangeSet(files: PullFile[], ignoreGlobs: readonly string[]): ChangeSet {
   const isIgnored = picomatch([...ignoreGlobs], { dot: true });
   const reviewable: ReviewableFile[] = [];
   const ignored: string[] = [];
+  const everything: Array<[string, string]> = [];
   for (const file of files) {
     if (file.status === 'unchanged') continue;
+    const fingerprint = fileFingerprint(file);
+    everything.push([file.filename, fingerprint]);
     if (isIgnored(file.filename)) {
       ignored.push(file.filename);
       continue;
@@ -57,30 +77,27 @@ export function buildChangeSet(files: PullFile[], ignoreGlobs: readonly string[]
       additions: file.additions,
       deletions: file.deletions,
       patch: file.patch,
-      fingerprint: fileFingerprint(file),
+      fingerprint,
     });
   }
-  const fileFingerprints = Object.fromEntries(reviewable.map((f) => [f.path, f.fingerprint]));
-  const fingerprint = sha256(
-    reviewable
-      .map((f) => `${f.path}\0${f.fingerprint}`)
-      .sort()
-      .join('\n'),
-  ).slice(0, 32);
+  const quizzable = reviewable.filter(isReadable).map((f): [string, string] => [f.path, f.fingerprint]);
   return {
     files: reviewable,
     ignored,
-    fingerprint,
-    fileFingerprints,
-    hasReadableChanges: reviewable.some((f) => !!f.patch && f.patch.trim() !== ''),
+    fingerprint: hashEntries(quizzable),
+    fullFingerprint: hashEntries(everything),
+    fileFingerprints: Object.fromEntries(quizzable),
+    hasReadableChanges: quizzable.length > 0,
     possiblyIncomplete: files.length >= 3000,
   };
 }
 
-/** Paths whose change differs from an earlier snapshot (changed, new, or removed from the PR). */
+/** Quizzable paths whose change differs from an earlier snapshot (changed, new, or removed from the PR). */
 export function changedSince(previous: Record<string, string> | undefined, current: ChangeSet): string[] | null {
   if (!previous) return null;
-  const changed = current.files.filter((f) => previous[f.path] !== f.fingerprint).map((f) => f.path);
+  const changed = Object.entries(current.fileFingerprints)
+    .filter(([path, fp]) => previous[path] !== fp)
+    .map(([path]) => path);
   const dropped = Object.keys(previous).filter((path) => !(path in current.fileFingerprints));
   return [...changed, ...dropped];
 }

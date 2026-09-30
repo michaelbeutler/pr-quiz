@@ -4,6 +4,7 @@ import { DEFAULT_IGNORE_PATHS, type Config } from '../src/config.ts';
 import {
   GitHubError,
   loginsEqual,
+  type CommentHistory,
   type CommitStatus,
   type ContentEdit,
   type GitHubApi,
@@ -76,6 +77,8 @@ export class FakeGitHub implements GitHubApi {
   requested: string[] = [];
   reactions: Array<{ commentId: number; content: string }> = [];
   permissions = new Map<string, string>();
+  /** GitHub users who authored or committed commits of the pull request. */
+  committers = new Set<string>(['author']);
   fileContents = new Map<string, string>();
   /** Mirrors "Allow GitHub Actions to create and approve pull requests". */
   botMayApprove = true;
@@ -114,12 +117,20 @@ export class FakeGitHub implements GitHubApi {
     return comment;
   }
 
-  private recordEdit(comment: StoredComment, editor: string, isBot: boolean): void {
+  /** Replaces a comment body the way GitHub does, recording the revision (with its full body) in the history. */
+  private edit(comment: StoredComment, body: string, editor: string, isBot: boolean): void {
     if (comment.edits.length === 0) {
       // GitHub records the original version as the oldest entry on the first edit.
-      comment.edits.unshift({ editor: comment.user!.login.replace(/\[bot\]$/, ''), isBot: comment.user!.type === 'Bot', editedAt: comment.created_at });
+      comment.edits.unshift({
+        editor: comment.user!.login.replace(/\[bot\]$/, ''),
+        isBot: comment.user!.type === 'Bot',
+        editedAt: comment.created_at,
+        body: comment.body,
+      });
     }
-    comment.edits.unshift({ editor: editor.replace(/\[bot\]$/, ''), isBot, editedAt: this.time() });
+    comment.body = body;
+    comment.updated_at = this.time();
+    comment.edits.unshift({ editor: editor.replace(/\[bot\]$/, ''), isBot, editedAt: comment.updated_at, body });
   }
 
   // --- GitHubApi -------------------------------------------------------------------------------------------------
@@ -157,9 +168,7 @@ export class FakeGitHub implements GitHubApi {
   }
   async updateComment(commentId: number, body: string): Promise<IssueComment> {
     const comment = this.comment(commentId);
-    comment.body = body;
-    comment.updated_at = this.time();
-    this.recordEdit(comment, this.botLogin, true);
+    this.edit(comment, body, this.botLogin, true);
     return structuredClone({ ...comment, edits: undefined }) as IssueComment;
   }
   async createReview(_pr: number, event: ReviewEvent, body: string, commitId: string): Promise<Review> {
@@ -187,13 +196,17 @@ export class FakeGitHub implements GitHubApi {
   async getStatus(sha: string, context: string): Promise<CommitStatus | null> {
     return this.statuses.filter((s) => s.sha === sha && s.context === context).at(-1) ?? null;
   }
-  async getCommentEdits(nodeId: string): Promise<ContentEdit[]> {
+  async getCommentEdits(nodeId: string): Promise<CommentHistory> {
     if (this.failEditHistory) throw new GitHubError('GraphQL unavailable', 502);
     const comment = this.comments.find((c) => c.node_id === nodeId);
-    return structuredClone(comment?.edits ?? []);
+    return { edits: structuredClone(comment?.edits ?? []), complete: true };
   }
-  async getPermission(login: string): Promise<string> {
-    return this.permissions.get(login) ?? 'write';
+  async hasWriteAccess(login: string): Promise<boolean> {
+    // Unknown users are collaborators with write access; custom roles based on write can push too.
+    return !['read', 'triage', 'none'].includes(this.permissions.get(login) ?? 'write');
+  }
+  async listCommitters(): Promise<string[]> {
+    return [...this.committers];
   }
   async addReaction(commentId: number, content: '+1' | 'eyes' | 'confused' | 'rocket'): Promise<void> {
     this.reactions.push({ commentId, content });
@@ -257,12 +270,48 @@ export class FakeGitHub implements GitHubApi {
       if (++seen !== index) continue;
       lines[i] = lines[i]!.includes('[ ]') ? lines[i]!.replace('[ ]', '[x]') : lines[i]!.replace(/\[[xX]\]/, '[ ]');
       // The web UI saves with CRLF line endings.
-      comment.body = lines.join('\r\n');
-      comment.updated_at = this.time();
-      this.recordEdit(comment, login, false);
+      this.edit(comment, lines.join('\r\n'), login, false);
       return;
     }
     throw new Error(`checkbox ${index} not found in comment ${commentId}`);
+  }
+
+  /** Someone with write access edits the raw markdown of a comment (the "Edit" menu). */
+  editBody(login: string, commentId: number, body: string, isBot = false): void {
+    this.edit(this.comment(commentId), body, login, isBot);
+  }
+
+  /** Someone with write access deletes a revision's content from the edit history. */
+  pruneRevision(commentId: number, which: (edit: ContentEdit, index: number) => boolean): void {
+    for (const [index, edit] of this.comment(commentId).edits.entries()) if (which(edit, index)) edit.body = null;
+  }
+
+  /** Any workflow using GITHUB_TOKEN posts as github-actions[bot], just like the quiz bot. */
+  postAsBot(body: string): StoredComment {
+    const id = this.nextId++;
+    const now = this.time();
+    const comment: StoredComment = {
+      id,
+      node_id: `IC_${id}`,
+      user: this.botActor(),
+      body,
+      html_url: `${this.pr.html_url}#issuecomment-${id}`,
+      created_at: now,
+      updated_at: now,
+      edits: [],
+    };
+    this.comments.push(comment);
+    return comment;
+  }
+
+  bodyOf(commentId: number): string {
+    return this.comment(commentId).body;
+  }
+
+  /** Changes what the pull request contains without a new head commit (e.g. retargeting the base branch). */
+  retarget(files: PullFile[], base: string): void {
+    this.files = files;
+    this.pr.base.ref = base;
   }
 
   /** Answers a quiz as `login`. `pick(questionIndex, optionTexts)` returns the option index to tick. */
@@ -276,9 +325,10 @@ export class FakeGitHub implements GitHubApi {
     if (submit) this.toggleCheckbox(login, commentId, offset);
   }
 
-  push(files: PullFile[]): void {
+  push(files: PullFile[], by = 'author'): void {
     this.files = files;
-    this.pr.head.sha = createHash('sha1').update(JSON.stringify(files) + this.tick).digest('hex');
+    this.committers.add(by);
+    this.pr.head.sha = createHash('sha1').update(JSON.stringify(files) + this.tick++).digest('hex');
   }
 
   /** Most recent quiz comment (any status) for the reviewer. */

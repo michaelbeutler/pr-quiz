@@ -14,8 +14,11 @@ export function mention(login: string): string {
   return `@${login}`;
 }
 
-/** An inline code span as CommonMark defines it: a run of N backticks closed by a run of exactly N. */
-const CODE_SPAN = /(?<!`)(`+)(?!`)[\s\S]*?[^`]\1(?!`)/g;
+/**
+ * An inline code span as CommonMark defines it: a run of N backticks closed by a run of exactly N.
+ * A backslash-escaped backtick is literal text and never opens a span.
+ */
+const CODE_SPAN = /(?<![`\\])(`+)(?!`)[\s\S]*?[^`]\1(?!`)/g;
 
 /**
  * Escapes `<`/`>` outside inline code spans so generated text cannot inject HTML. Inside code spans `<!--` is
@@ -52,6 +55,11 @@ export function extractSealedState(body: string): string | null {
 
 export function isQuizBody(body: string | null | undefined): boolean {
   return !!body && body.includes(QUIZ_MARKER) && STATE_RE.test(body);
+}
+
+/** Posted first, then replaced by the quiz once the comment id is known and can be sealed into the state. */
+export function renderPlaceholder(reviewer: string): string {
+  return `⏳ Preparing a PR Quiz for ${mention(reviewer)}…`;
 }
 
 function shortSha(sha: string): string {

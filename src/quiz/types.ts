@@ -37,14 +37,25 @@ export interface QuizResult {
 export interface QuizState {
   v: 1;
   id: string;
+  /**
+   * The comment this state belongs to. A state found in any other comment is a replay and is ignored.
+   * Unset only while the comment is being created.
+   */
+  commentId?: number;
   /** Login of the only person allowed to answer. */
   reviewer: string;
   /** 1-based attempt number of this reviewer on this pull request. */
   attempt: number;
+  /** Failed attempts before this quiz; carried forward so deleting old quiz comments does not reset it. */
+  failedBefore?: number;
+  /** Questions this reviewer saw in earlier quizzes, carried forward for the same reason. */
+  asked?: string[];
   /** Pull request head when the quiz was generated. */
   headSha: string;
-  /** Fingerprint of all reviewable changes when the quiz was generated. */
+  /** Fingerprint of the quizzable changes when the quiz was generated. */
   fingerprint: string;
+  /** Fingerprint of all changes (including ignored and binary files) when the quiz was graded. */
+  fullFingerprint?: string;
   /** Per-file fingerprints (omitted for very large pull requests). Used to scope follow-up quizzes. */
   files?: Record<string, string>;
   /** 'incremental' quizzes only cover files that changed since the reviewer last passed. */
