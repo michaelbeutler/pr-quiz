@@ -37,7 +37,7 @@ jobs:
       group: pr-quiz-${{ github.event.pull_request.number || github.event.issue.number }}
       cancel-in-progress: false
     steps:
-      - uses: your-org/pr-quiz@v1
+      - uses: michaelbeutler/pr-quiz@v1
         with:
           # Connect Claude with one of these two secrets:
           #   CLAUDE_CODE_OAUTH_TOKEN: your Claude subscription (`claude setup-token`)

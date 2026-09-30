@@ -55,8 +55,9 @@ gets a 408 response every time. How many attempts does ky make, and why?
 ### 1. Add the workflow
 
 Copy [`examples/pr-quiz.yml`](examples/pr-quiz.yml) to `.github/workflows/pr-quiz.yml` in the repository you
-want to protect, and replace `your-org/pr-quiz@v1` with wherever you publish this action (see
-[Publishing](#publishing)).
+want to protect. It uses `michaelbeutler/pr-quiz@v1` (see [Publishing](#publishing) for creating the `v1`
+tag). While this repository is private, other repositories can only use the action after allowing it under
+**Settings → Actions → General → Access** in this repository.
 
 ### 2. Connect Claude
 
@@ -97,7 +98,7 @@ the repository, and pass its token:
         with:
           app-id: ${{ vars.PR_QUIZ_APP_ID }}
           private-key: ${{ secrets.PR_QUIZ_APP_KEY }}
-      - uses: your-org/pr-quiz@v1
+      - uses: michaelbeutler/pr-quiz@v1
         with:
           github-token: ${{ steps.app.outputs.token }}
           claude-code-oauth-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
@@ -213,4 +214,4 @@ GitHub runs the committed bundle, so run `npm run build` and commit `dist/` befo
 git tag v1.0.0 && git tag -f v1 && git push origin v1.0.0 v1 --force
 ```
 
-Consumers then use `uses: <owner>/pr-quiz@v1`.
+Consumers then use `uses: michaelbeutler/pr-quiz@v1`.
