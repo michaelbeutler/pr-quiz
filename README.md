@@ -1,8 +1,8 @@
 <div align="center">
 
-<a href="docs/media/pr-quiz-demo.mp4"><img src="docs/media/pr-quiz-demo.gif" width="800" alt="PR Quiz demo: a reviewer approves with LGTM, the bot posts a quiz, a wrong answer dismisses the approval, new questions appear, the right answers turn the pr-quiz check green"></a>
+<a href="docs/media/pr-quiz-demo.mp4"><img src="docs/media/pr-quiz-demo.gif" width="800" alt="PR Quiz Gate demo: a reviewer approves with LGTM, the bot posts a quiz, a wrong answer dismisses the approval, new questions appear, the right answers turn the pr-quiz check green"></a>
 
-# PR Quiz
+# PR Quiz Gate
 
 **Approvals that prove understanding.**
 
@@ -10,9 +10,9 @@ A GitHub Action that won't let an approval count until the reviewer passes a sho
 that Claude writes about the diff. One wrong answer and the approval is dismissed.
 
 [![CI](https://github.com/michaelbeutler/pr-quiz/actions/workflows/ci.yml/badge.svg)](https://github.com/michaelbeutler/pr-quiz/actions/workflows/ci.yml)
-[![GitHub Action](https://img.shields.io/badge/GitHub-Action-2088FF?logo=githubactions&logoColor=white)](action.yml)
+[![GitHub Marketplace](https://img.shields.io/badge/Marketplace-PR%20Quiz%20Gate-2088FF?logo=githubactions&logoColor=white)](https://github.com/marketplace/actions/pr-quiz-gate)
 [![Questions by Claude](https://img.shields.io/badge/questions%20by-Claude-a371f7)](#2-connect-claude)
-![Node 24](https://img.shields.io/badge/node-24-3fb950?logo=nodedotjs&logoColor=white)
+[![License: MIT](https://img.shields.io/badge/license-MIT-3fb950)](LICENSE)
 
 [**▶ Demo video with sound** (MP4)](docs/media/pr-quiz-demo.mp4) · [Quick start](#quick-start) · [How it works](#how-it-works) · [Configuration](#configuration)
 
@@ -21,7 +21,7 @@ that Claude writes about the diff. One wrong answer and the approval is dismisse
 ---
 
 AI writes more of our code every day, and a quick **LGTM** is often the only human check it gets.
-PR Quiz makes that check count: when someone approves a pull request, a bot posts a few multiple-choice
+PR Quiz Gate makes that check count: when someone approves a pull request, a bot posts a few multiple-choice
 questions about what the change actually does. The approval only counts once the reviewer ticks the right
 answers.
 
@@ -83,7 +83,7 @@ sequenceDiagram
     actor Author
     actor Reviewer as Reviewer (@alice)
     participant PR as Pull request
-    participant Bot as PR Quiz
+    participant Bot as PR Quiz Gate
     participant Claude
     Author->>PR: opens the PR, requests a review from @alice
     Reviewer->>PR: approves ("LGTM")
@@ -125,8 +125,7 @@ bot writes.
 ### 1. Add the workflow
 
 Copy [`examples/pr-quiz.yml`](examples/pr-quiz.yml) to `.github/workflows/pr-quiz.yml` in the repository you
-want to protect. It uses `michaelbeutler/pr-quiz@v1` (see [Publishing](#publishing) for creating the `v1`
-tag).
+want to protect. It uses `michaelbeutler/pr-quiz@v1`.
 
 ### 2. Connect Claude
 
@@ -309,7 +308,12 @@ GitHub runs the committed bundle, so run `npm run build` and commit `dist/` befo
 git tag v1.0.0 && git tag -f v1 && git push origin v1.0.0 v1 --force
 ```
 
-Consumers then use `uses: michaelbeutler/pr-quiz@v1`.
+Consumers then use `uses: michaelbeutler/pr-quiz@v1`. To update the Marketplace listing, draft a release for the
+new tag and keep **Publish this Action to the GitHub Marketplace** ticked.
+
+## License
+
+[MIT](LICENSE). The music in the demo video is by ende.app and isn't covered by this license.
 
 ---
 
