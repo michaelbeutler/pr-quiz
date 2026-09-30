@@ -126,8 +126,7 @@ bot writes.
 
 Copy [`examples/pr-quiz.yml`](examples/pr-quiz.yml) to `.github/workflows/pr-quiz.yml` in the repository you
 want to protect. It uses `michaelbeutler/pr-quiz@v1` (see [Publishing](#publishing) for creating the `v1`
-tag). While this repository is private, other repositories can only use the action after allowing it under
-**Settings → Actions → General → Access** in this repository.
+tag).
 
 ### 2. Connect Claude
 
