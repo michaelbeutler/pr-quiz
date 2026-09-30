@@ -14,7 +14,7 @@ that Claude writes about the diff. One wrong answer and the approval is dismisse
 [![Questions by Claude](https://img.shields.io/badge/questions%20by-Claude-a371f7)](#2-connect-claude)
 ![Node 24](https://img.shields.io/badge/node-24-3fb950?logo=nodedotjs&logoColor=white)
 
-[**▶ Watch the demo with sound**](docs/media/pr-quiz-demo.mp4) · [Quick start](#quick-start) · [How it works](#how-it-works) · [Configuration](#configuration)
+[**▶ Demo video with sound** (MP4)](docs/media/pr-quiz-demo.mp4) · [Quick start](#quick-start) · [How it works](#how-it-works) · [Configuration](#configuration)
 
 </div>
 
