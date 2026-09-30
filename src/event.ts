@@ -46,7 +46,8 @@ export function parseEvent(eventName: string, raw: unknown, command: string): Pa
             `The reviewer can comment "${command}" to take the quiz instead.`,
         };
       }
-      if (payload.review?.user?.type === 'Bot') return { prNumber, skipReason: 'the review was submitted by a bot.' };
+      // The sender caused the event: for a dismissal that is the dismisser, not the review's author.
+      if (payload.sender?.type === 'Bot') return { prNumber, skipReason: 'the review event was caused by a bot.' };
       const approved = payload.action === 'submitted' && payload.review?.state?.toLowerCase() === 'approved';
       return { prNumber, trigger: { kind: approved ? 'approval' : 'review', actor: payload.review?.user?.login } };
     }

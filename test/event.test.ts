@@ -33,6 +33,26 @@ describe('parseEvent', () => {
     expect(parsed.skipReason).toContain('/pr-quiz');
   });
 
+  it('decides about bot review events by who caused them, not by who wrote the review', () => {
+    const base = { repository, pull_request: { number: 7, head: { repo: { full_name: 'acme/shop' } } } };
+    // A human dismisses the bot's blocking review: re-evaluate so the block comes back.
+    expect(
+      parseEvent(
+        'pull_request_review',
+        { ...base, action: 'dismissed', sender: { login: 'alice', type: 'User' }, review: { state: 'dismissed', user: { login: 'github-actions[bot]', type: 'Bot' } } },
+        '/pr-quiz',
+      ).trigger,
+    ).toEqual({ kind: 'review', actor: 'github-actions[bot]' });
+    // The bot dismissing a human's approval (App token) is its own doing: skip.
+    expect(
+      parseEvent(
+        'pull_request_review',
+        { ...base, action: 'dismissed', sender: { login: 'pr-quiz[bot]', type: 'Bot' }, review: { state: 'dismissed', user: { login: 'alice', type: 'User' } } },
+        '/pr-quiz',
+      ).skipReason,
+    ).toBeDefined();
+  });
+
   it('recognizes quiz edits and commands, and ignores other comments', () => {
     const base = { repository, issue: { number: 7, pull_request: {} }, sender: { login: 'alice', type: 'User' } };
     expect(parseEvent('issue_comment', { ...base, action: 'edited', comment: { body: '<!-- pr-quiz:quiz -->' } }, '/pr-quiz').trigger).toEqual({
