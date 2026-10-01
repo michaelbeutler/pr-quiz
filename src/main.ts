@@ -58,7 +58,10 @@ async function run(): Promise<void> {
     : new ClaudeCodeBackend(config.claudeCodeOAuthToken ?? '', config.model, config.effort, config.claudeCodeVersion);
 
   const trigger = event.trigger ?? { kind: 'manual' as const };
-  log.info(`PR #${prNumber} · trigger: ${trigger.kind}${trigger.actor ? ` by ${trigger.actor}` : ''} · questions by ${llm.label} (${llm.model})`);
+  const verb = trigger.command ? ` (${trigger.command.verb})` : '';
+  log.info(
+    `PR #${prNumber} · trigger: ${trigger.kind}${verb}${trigger.actor ? ` by ${trigger.actor}` : ''} · questions by ${llm.label} (${llm.model})`,
+  );
 
   const result = await reconcile({ gh, codec, config, llm }, prNumber, trigger);
   log.info(`Gate: ${result.gate} · ${result.description}`);

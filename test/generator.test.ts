@@ -102,6 +102,25 @@ describe('generateQuiz', () => {
     expect(task).toContain('follow-up quiz');
     expect(task).toContain('Write in German.');
   });
+
+  it('frames author quizzes and forbids questions about motives', () => {
+    const challenge = buildGenerationTask(input({ audience: 'author', challengers: ['carol'] }), 3);
+    expect(challenge.split('\n')[1]).toMatch(
+      /^Write 3 multiple-choice questions for @alice, an author of this pull request\. @carol, reviewing it, challenged @alice/,
+    );
+    expect(challenge).toContain('Do not ask about motives');
+    expect(challenge).toContain('no question may be answerable by restating them');
+
+    const practice = buildGenerationTask(input({ audience: 'author', challengers: [] }), 3);
+    expect(practice).toContain('Write 3 multiple-choice questions for @alice, an author of this pull request');
+    expect(practice).toContain('asked to practice');
+    expect(practice).toContain('Do not ask about motives');
+
+    const review = buildGenerationTask(input(), 3);
+    expect(review).toContain('who is reviewing this pull request');
+    expect(review).not.toContain('an author of this pull request');
+    expect(review).not.toContain('Do not ask about motives');
+  });
 });
 
 describe('backend helpers', () => {

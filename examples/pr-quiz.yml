@@ -10,7 +10,8 @@ on:
   # pull_request_target runs this workflow from the base branch; the action never checks out PR code.
   pull_request_target:
     types: [opened, reopened, synchronize, ready_for_review, edited]
-  # Ticking checkboxes edits the quiz comment; "/pr-quiz" requests a quiz without approving first.
+  # Ticking checkboxes edits the quiz comment; "/pr-quiz" requests a quiz without approving first,
+  # "/pr-quiz challenge @author" asks an author of the change to pass one too.
   issue_comment:
     types: [created, edited]
 
@@ -47,4 +48,5 @@ jobs:
           # questions: 3
           # model: claude-opus-5-5
           # require-all-approvers: true
+          # allow-challenges: true
           # extra-instructions: Focus on security and data handling.

@@ -20,12 +20,14 @@ export type ReviewState = 'APPROVED' | 'CHANGES_REQUESTED' | 'COMMENTED' | 'DISM
 
 export interface Review {
   id: number;
+  node_id?: string;
   user: Actor | null;
   state: ReviewState;
   body: string | null;
   commit_id: string | null;
   submitted_at?: string | null;
   author_association?: string;
+  html_url?: string;
 }
 
 export interface IssueComment {
@@ -80,13 +82,17 @@ export interface GitHubApi {
   createComment(pr: number, body: string): Promise<IssueComment>;
   updateComment(commentId: number, body: string): Promise<IssueComment>;
   createReview(pr: number, event: ReviewEvent, body: string, commitId: string): Promise<Review>;
+  /** Replaces the body of a submitted review. */
+  updateReview(pr: number, reviewId: number, body: string): Promise<Review>;
   dismissReview(pr: number, reviewId: number, message: string): Promise<void>;
   requestReviewers(pr: number, logins: string[]): Promise<void>;
   setStatus(sha: string, status: CommitStatus): Promise<void>;
   /** Most recent status with this context on the commit, if any. */
   getStatus(sha: string, context: string): Promise<CommitStatus | null>;
-  /** Edit history of an issue comment, newest first (GitHub's order). */
+  /** Edit history of an issue comment or pull request review, newest first (GitHub's order). */
   getCommentEdits(commentNodeId: string): Promise<CommentHistory>;
+  /** Ids of the pull request's reviews whose body was edited after they were submitted. */
+  listEditedReviewIds(pr: number): Promise<Set<number>>;
   /** Whether the user can push to the repository (admin, maintain, write or a custom role based on them). */
   hasWriteAccess(login: string): Promise<boolean>;
   /** GitHub users who authored or committed any non-merge commit of the pull request. */

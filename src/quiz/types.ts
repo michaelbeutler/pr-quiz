@@ -72,6 +72,12 @@ export interface QuizState {
   scope: 'full' | 'incremental';
   /** Requested by an author of the change: a pass doesn't count toward the gate and a failure dismisses nothing. */
   practice?: boolean;
+  /**
+   * Set when reviewers challenged this author: the gate waits for the quiz and a failure dismisses nothing. `refs`
+   * are the challenges the quiz was posted for; `later` are challenges made while it was open or after it passed,
+   * kept only as a copy of their records (they don't count its attempts).
+   */
+  challenge?: { refs: ChallengeRef[]; later?: ChallengeRef[] };
   /** The submit checkbox carries the reviewer's statement that they did not ask an AI for the answers. */
   attested?: boolean;
   status: QuizStatus;
@@ -89,6 +95,26 @@ export interface QuizState {
   voidedBy?: string[];
   /** Why an outdated/void quiz was closed, when the default wording does not fit. */
   closedReason?: string;
+}
+
+export type QuizKind = 'review' | 'practice' | 'challenge';
+
+export const quizKind = (s: QuizState): QuizKind => (s.challenge ? 'challenge' : s.practice ? 'practice' : 'review');
+
+/**
+ * A challenge or its withdrawal. Each one is sealed into its own comment review of the bot and never changes, so
+ * a copy elsewhere is just a duplicate with the same id.
+ */
+export type ChallengeRecord =
+  | { v: 1; kind: 'challenge'; id: string; by: string; challengee: string; at: string; commandCommentId?: number }
+  | { v: 1; kind: 'withdraw'; ids: string[]; by: string; at: string; commandCommentId?: number };
+
+/** A challenge as each challenge quiz carries it, so the challenge survives even if its review is gone or altered beyond repair. */
+export interface ChallengeRef {
+  id: string;
+  by: string;
+  at: string;
+  commandCommentId?: number;
 }
 
 /** A quiz comment on the pull request together with its decrypted state. */

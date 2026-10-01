@@ -1,5 +1,5 @@
 name: PR Quiz Gate
-description: Quizzes PR approvers on the diff with questions Claude writes. An approval only counts once every answer is right.
+description: Quizzes PR approvers on the diff with questions Claude writes, and authors when a reviewer challenges them.
 author: Michael Beutler
 branding:
   icon: help-circle
@@ -43,18 +43,29 @@ inputs:
       false: one passing reviewer is enough.
     default: "true"
   max-attempts:
-    description: Failed attempts allowed per reviewer and pull request before no new quiz is generated (0 = unlimited).
+    description: >-
+      Failed attempts allowed per reviewer and pull request, and per challenge for a challenged author, before no
+      new quiz is generated (0 = unlimited).
     default: "5"
   submit-reviews:
     description: >-
-      Let the bot submit REQUEST_CHANGES while a quiz is pending and APPROVE once it passes.
+      Let the bot submit REQUEST_CHANGES while a quiz or a challenge is pending and APPROVE once it passes.
       Approving needs "Allow GitHub Actions to create and approve pull requests" when using GITHUB_TOKEN.
+    default: "true"
+  allow-challenges:
+    description: >-
+      Let reviewers whose pass could open the gate challenge an author of the change with
+      `/pr-quiz challenge [@author]`; the gate then also waits for that author to pass a quiz.
+      false turns challenges off and ignores existing ones.
     default: "true"
   status-context:
     description: Name of the commit status. Mark it as required in branch protection or a ruleset.
     default: pr-quiz
   command:
-    description: Comment command that lets a reviewer request a quiz without approving first (needed for pull requests from forks).
+    description: >-
+      Comment command. `/pr-quiz` requests a quiz without approving first (needed for pull requests from forks;
+      a practice quiz for authors). `/pr-quiz challenge [@author]` challenges an author of the change, and
+      `/pr-quiz withdraw [@author]` withdraws the challenge.
     default: /pr-quiz
   ignore-paths:
     description: Newline or comma separated globs of files to leave out of the quiz (added to lockfile/minified/snapshot defaults).

@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { parseCommand, type Command } from '../src/command.ts';
 import { ConfigError, readConfig } from '../src/config.ts';
 import { isCommand, parseEvent } from '../src/event.ts';
 
@@ -84,6 +85,44 @@ describe('parseEvent', () => {
     expect(isCommand('/pr-quizzes', '/pr-quiz')).toBe(false);
     expect(isCommand('please /pr-quiz', '/pr-quiz')).toBe(false);
   });
+
+  it('parses subcommands', () => {
+    const cases: Array<[string, Command | null]> = [
+      ['/pr-quiz', { verb: 'quiz' }],
+      ['/pr-quiz please', { verb: 'quiz' }],
+      ['/pr-quiz challenger', { verb: 'quiz' }],
+      ['/pr-quiz @bob please look', { verb: 'quiz' }],
+      ['/PR-QUIZ Challenge @Bob, @carol please', { verb: 'challenge', targets: ['Bob', 'carol'] }],
+      ['/pr-quiz challenge @bob please explain the retry path', { verb: 'challenge', targets: ['bob'] }],
+      ['/pr-quiz challenge @bob,@carol. @BOB', { verb: 'challenge', targets: ['bob', 'carol'] }],
+      ['/pr-quiz challenge the author @bob', { verb: 'challenge', targets: [] }],
+      ['/pr-quiz challenge\n@bob', { verb: 'challenge', targets: [] }],
+      ['/pr-quiz challenge @dependabot[bot]', { verb: 'challenge', targets: ['dependabot[bot]'] }],
+      ['/pr-quiz withdraw @bob', { verb: 'withdraw', targets: ['bob'] }],
+      ['  /pr-quiz WITHDRAW', { verb: 'withdraw', targets: [] }],
+      // Answering by reply is not supported: this is a plain quiz request.
+      ['/pr-quiz answer B D A', { verb: 'quiz' }],
+      ['please /pr-quiz challenge', null],
+      ['/pr-quizzes challenge', null],
+    ];
+    for (const [body, expected] of cases) expect(parseCommand(body, '/pr-quiz'), body).toEqual(expected);
+    expect(parseCommand('/quiz challenge', '/quiz')).toEqual({ verb: 'challenge', targets: [] });
+  });
+
+  it('attaches the subcommand to command triggers', () => {
+    const base = { repository, issue: { number: 7, pull_request: {} }, sender: { login: 'alice', type: 'User' } };
+    const created = (body: string) =>
+      parseEvent('issue_comment', { ...base, action: 'created', comment: { id: 5, body, user: { login: 'alice' } } }, '/pr-quiz').trigger;
+    expect(created('/pr-quiz challenge @bob')).toEqual({
+      kind: 'command',
+      actor: 'alice',
+      commandCommentId: 5,
+      command: { verb: 'challenge', targets: ['bob'] },
+    });
+    expect(created('/pr-quiz please')).toEqual({ kind: 'command', actor: 'alice', commandCommentId: 5 });
+    expect(created('/pr-quiz please')).not.toHaveProperty('command');
+    expect(parseEvent('issue_comment', { ...base, action: 'edited', comment: { id: 5, body: '/pr-quiz challenge' } }, '/pr-quiz').skipReason).toBeDefined();
+  });
 });
 
 describe('readConfig', () => {
@@ -107,6 +146,13 @@ describe('readConfig', () => {
     });
     expect(config.ignorePaths).toContain('docs/**');
     expect(config.ignorePaths).toContain('**/package-lock.json');
+  });
+
+  it('turns challenges on by default', () => {
+    const base = { 'github-token': 't', 'anthropic-api-key': 'k' };
+    expect(readConfig(inputs(base)).allowChallenges).toBe(true);
+    expect(readConfig(inputs({ ...base, 'allow-challenges': 'false' })).allowChallenges).toBe(false);
+    expect(() => readConfig(inputs({ ...base, 'allow-challenges': 'nope' }))).toThrow(/true or false/);
   });
 
   it('validates numbers and booleans', () => {

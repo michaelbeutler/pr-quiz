@@ -43,6 +43,8 @@ export interface Config {
   requireAllApprovers: boolean;
   /** 0 = unlimited */
   maxAttempts: number;
+  /** Reviewers whose pass could open the gate may challenge an author of the change to pass a quiz too. */
+  allowChallenges: boolean;
   submitReviews: boolean;
   statusContext: string;
   command: string;
@@ -116,6 +118,7 @@ export function readConfig(input: (name: string) => string = getInput): Config {
     verifyQuestions: parseBool('verify-questions', input('verify-questions'), true),
     requireAllApprovers: parseBool('require-all-approvers', input('require-all-approvers'), true),
     maxAttempts: parseIntInRange('max-attempts', input('max-attempts'), 5, 0, 1000),
+    allowChallenges: parseBool('allow-challenges', input('allow-challenges'), true),
     submitReviews: parseBool('submit-reviews', input('submit-reviews'), true),
     statusContext: input('status-context') || 'pr-quiz',
     command,

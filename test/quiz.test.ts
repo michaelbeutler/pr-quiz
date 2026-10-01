@@ -2,8 +2,22 @@ import { describe, expect, it } from 'vitest';
 import { StateCodec } from '../src/quiz/crypto.ts';
 import { grade } from '../src/quiz/grade.ts';
 import { normalizeBody, parseOpenQuiz, readCheckboxes } from '../src/quiz/parse.ts';
-import { AI_NOTE, ATTESTATION, formatDuration, inlineText, isQuizBody, extractSealedState, renderQuiz } from '../src/quiz/render.ts';
-import type { QuizState } from '../src/quiz/types.ts';
+import {
+  AI_NOTE,
+  AI_NOTE_CHALLENGE,
+  ATTESTATION,
+  extractChallengeState,
+  formatDuration,
+  inlineText,
+  isQuizBody,
+  extractSealedState,
+  QUIZ_MARKER,
+  renderChallengeRecord,
+  renderPlaceholder,
+  renderQuiz,
+  REVIEW_MARKER,
+} from '../src/quiz/render.ts';
+import type { ChallengeRecord, QuizState } from '../src/quiz/types.ts';
 
 const baseState = (): QuizState => ({
   v: 1,
@@ -135,6 +149,101 @@ describe('rendering and parsing', () => {
     expect(body).toContain('SECRET-EXPLANATION');
     expect(body).toContain('➡️ New quiz: https://example.test/quiz-2');
     expect(readCheckboxes(body)).toHaveLength(0);
+  });
+});
+
+describe('challenges', () => {
+  const codec = new StateCodec('secret', 4242);
+  const sealed = 'SEALED_blob-1';
+  const record: ChallengeRecord = {
+    v: 1,
+    kind: 'challenge',
+    id: 'c1',
+    by: 'bob',
+    challengee: 'alice',
+    at: '2026-09-30T12:00:00.000Z',
+    commandCommentId: 5,
+  };
+  const withdrawal: ChallengeRecord = { v: 1, kind: 'withdraw', ids: ['c1'], by: 'bob', at: '2026-09-30T12:05:00.000Z' };
+  const challenged = (): QuizState => ({
+    ...baseState(),
+    attested: true,
+    challenge: { refs: [{ id: 'c1', by: 'bob', at: '2026-09-30T12:00:00.000Z', commandCommentId: 5 }] },
+  });
+
+  it('seals challenge records apart from quiz state', () => {
+    const blob = codec.sealChallenge(7, record);
+    expect(codec.openChallenge(7, blob)).toEqual(record);
+    expect(codec.openChallenge(7, codec.sealChallenge(7, withdrawal))).toEqual(withdrawal);
+    expect(codec.open(7, blob)).toBeNull();
+    expect(codec.openChallenge(7, codec.seal(7, baseState()))).toBeNull();
+    expect(codec.openChallenge(8, blob)).toBeNull();
+    expect(codec.openChallenge(7, codec.sealChallenge(7, { ...record, kind: 'x' } as unknown as ChallengeRecord))).toBeNull();
+    expect(codec.openChallenge(7, codec.sealChallenge(7, { ...withdrawal, ids: [1] } as unknown as ChallengeRecord))).toBeNull();
+    expect(codec.openChallenge(7, 'garbage')).toBeNull();
+  });
+
+  it('renders a challenge quiz that parses back intact', () => {
+    const state = challenged();
+    const body = renderQuiz(state, sealed);
+    expect(readCheckboxes(body)).toHaveLength(9);
+    expect(parseOpenQuiz(body, state, sealed)).toMatchObject({ readable: true, intact: true, submitted: false });
+    expect(parseOpenQuiz(renderQuiz(state, sealed, undefined, true), state, sealed)).toMatchObject({ intact: true, submitted: true });
+    expect(body).toContain(AI_NOTE_CHALLENGE);
+    expect(body).not.toContain(AI_NOTE);
+    expect(body).toContain('## 🎯 PR Quiz challenge for @alice');
+    expect(body).toContain('@alice, @bob challenged you to show that you understand this change.');
+    expect(body).toContain('If one is wrong, you see the right answers and get new questions; nothing on the pull request is dismissed.');
+    expect(body).toContain(`- [ ] **Submit answers**: ${ATTESTATION}`);
+    expect(body).toContain('<sub>Attempt 1 · challenge · commit');
+    expect(renderQuiz({ ...state, attempt: 2 }, sealed)).toContain('@alice, not all of your previous answers were correct');
+    expect(renderQuiz({ ...state, scope: 'incremental' }, sealed)).toContain(
+      '@alice, new commits changed this pull request after you passed the challenge quiz.',
+    );
+    expect(renderPlaceholder('alice', true)).toBe('⏳ Preparing a PR Quiz challenge for @alice…');
+    expect(renderPlaceholder('alice')).toBe('⏳ Preparing a PR Quiz for @alice…');
+  });
+
+  it('renders closed challenge quizzes', () => {
+    const gradedAt = '2026-09-30T12:01:00Z';
+    const passed = renderQuiz({ ...challenged(), status: 'passed', result: { answers: [1, 0], correct: [true, true], gradedAt } }, sealed);
+    expect(passed).toContain('## ✅ PR Quiz challenge passed by @alice');
+    expect(passed).toContain(`@alice confirmed: _${ATTESTATION}_`);
+    expect(passed).toContain('This meets the challenge by @bob.');
+    const failed = renderQuiz({ ...challenged(), status: 'failed', result: { answers: [1, 2], correct: [true, false], gradedAt } }, sealed);
+    expect(failed).toContain('## ❌ PR Quiz challenge not passed by @alice (1 of 2 correct)');
+    expect(renderQuiz({ ...challenged(), status: 'outdated' }, sealed)).toContain('## ⏭️ PR Quiz challenge for @alice: no longer active');
+    expect(renderQuiz({ ...challenged(), status: 'void' }, sealed)).toContain('## 🚫 PR Quiz challenge for @alice: invalidated');
+  });
+
+  it('renders challenge records', () => {
+    const info = { command: '/pr-quiz' };
+    const body = renderChallengeRecord(record, codec.sealChallenge(7, record), info);
+    expect(body).toContain('🎯 **PR Quiz challenge:** @bob challenged @alice to show that they understand this change.');
+    expect(body).toContain('@alice, the bot posts a quiz about the change in the conversation.');
+    expect(body).toContain('only @bob can withdraw it, with `/pr-quiz withdraw @alice`');
+    expect(codec.openChallenge(7, extractChallengeState(body)!)).toEqual(record);
+    expect(body).not.toContain(REVIEW_MARKER);
+    expect(body).not.toContain(QUIZ_MARKER);
+    expect(isQuizBody(body)).toBe(false);
+    expect(extractSealedState(body)).toBeNull();
+
+    expect(renderChallengeRecord(record, sealed, { ...info, openQuizUrl: 'https://example.test/quiz' })).toContain(
+      "@alice's open challenge quiz covers this challenge too: https://example.test/quiz",
+    );
+    expect(renderChallengeRecord(record, sealed, { ...info, met: true })).toContain(
+      '@alice already passed a challenge quiz on this version of the change, so the challenge is met until new commits change the code.',
+    );
+    const extra = renderChallengeRecord(record, sealed, { ...info, renewedAttempts: 5, notAuthors: ['carol'], noWriteAccess: ['dave'] });
+    expect(extra).toContain('@alice had used all 5 attempts; this challenge gives them 5 new ones.');
+    expect(extra).toContain('`carol` is not a human author of this change, so they were not challenged.');
+    expect(extra).toContain("`dave` can't answer a quiz here (no write access), so they were not challenged.");
+
+    const withdrawn = renderChallengeRecord(withdrawal, sealed, { ...info, challengees: ['alice'], remaining: ['carol'] });
+    expect(withdrawn).toContain('↩️ **PR Quiz challenge withdrawn:** @bob withdrew their challenge for @alice.');
+    expect(withdrawn).toContain('The challenge by @carol still applies.');
+    expect(extractChallengeState(withdrawn)).toBe(sealed);
+    expect(renderChallengeRecord(withdrawal, sealed, { ...info, challengees: ['alice'] })).not.toContain('still applies');
   });
 });
 

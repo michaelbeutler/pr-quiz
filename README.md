@@ -25,6 +25,8 @@ PR Quiz Gate makes that check count: when someone approves a pull request, a bot
 questions about what the change actually does. The approval only counts once the reviewer ticks the right
 answers.
 
+Reviewers can also **[challenge the author](#challenge-the-author)** to answer questions about their own change.
+
 ## See it in action
 
 <table>
@@ -116,7 +118,8 @@ sequenceDiagram
 9. The bot **approves** on their behalf and `pr-quiz` turns green.
 
 Run `npm run simulate` to watch this exact sequence against an in-memory GitHub and see every comment the
-bot writes.
+bot writes. It then goes on to show @alice challenging the author (see
+[Challenge the author](#challenge-the-author)).
 
 </details>
 
@@ -194,12 +197,99 @@ first step of the hardening described under [Limitations](#limitations).
 - The PR author and anyone who authored or committed one of its commits can't pass the gate: their
   approvals neither pass nor block it. Merge commits (e.g. from "Update branch") don't count as authorship.
   Authors with write access can still comment `/pr-quiz` for a practice quiz; it doesn't count toward the
-  gate, and a wrong answer changes nothing on the pull request.
+  gate, and a wrong answer changes nothing on the pull request. To make an author's quiz count, challenge
+  them (see [Challenge the author](#challenge-the-author)).
 - If new commits change the code after you passed, and your approval is still active, you get a short
   follow-up quiz about the files that changed. A rebase that doesn't change the diff keeps your pass.
 - Changes a quiz can't cover (ignored files like lockfiles, binary files, diffs too large for GitHub to show)
   never pass silently. Once you passed, such a change only needs you to approve the latest commit again; a PR
   consisting only of such changes needs an approval of its latest commit instead of a quiz.
+
+## Challenge the author
+
+A reviewer can ask the author to show that they understand their own change, for example code an AI wrote, by
+commenting `/pr-quiz challenge`. The bot records the challenge and posts a quiz for the author. The `pr-quiz`
+check stays pending, and the bot keeps its *Changes requested* review, until the author answers every question
+correctly, however many reviewers have passed.
+
+| Comment | Who | Effect |
+| --- | --- | --- |
+| `/pr-quiz challenge` | a reviewer | Challenges the PR author. On a PR a bot opened, challenges every human who committed to it. |
+| `/pr-quiz challenge @bob @carol` | a reviewer | Challenges the named authors of the change. |
+| `/pr-quiz withdraw` | the challenger | Withdraws all of your challenges on the PR. |
+| `/pr-quiz withdraw @bob` | the challenger | Withdraws your challenge of @bob. |
+| `/pr-quiz` | a challenged author | Brings up your challenge quiz. You get no practice quiz while a challenge is active. |
+
+- **Who can challenge:** anyone whose own pass could open the gate, meaning write access and not an author of
+  the change.
+- **Who can be challenged:** the PR author and anyone who authored or committed one of its commits, if they
+  have write access. Mentions of anyone else are skipped, and the challenge record says so.
+- **The author must pass:** wrong answers show the right ones and bring new questions, and nothing is
+  dismissed. One passed quiz meets every challenge to that author. It never replaces a reviewer's pass, and
+  `require-all-approvers: false` doesn't skip it.
+- **Attempts:** `max-attempts` applies per challenge. An author who runs out stays blocked until a reviewer
+  challenges again (new attempts) or every reviewer who challenged them withdraws.
+- **New commits:** after a pass, commits that change the code bring a short follow-up quiz. Ignored or binary
+  files don't.
+- **Practice doesn't count:** an open practice quiz is replaced, and a passed one doesn't meet a challenge.
+- **Withdrawing:** only the challenger can withdraw. The author can't, and neither can other reviewers.
+- **Recorded so it sticks:** see [How it works](#how-it-works).
+
+The bot reacts to each command with 👀 first, then with the result. If a command gets no 👀, comment it
+again. Rejections post no comment; the reason is in the job summary.
+
+| Command | 🚀 | 👍 | 😕 |
+| --- | --- | --- | --- |
+| `challenge` | recorded | you already challenged them and they have attempts left or already passed | rejected: you can't pass the gate yourself, no one to challenge, nothing to quiz, challenges are turned off, or the record couldn't be posted |
+| `withdraw` | | withdrawn | nothing of yours to withdraw, no write access, challenges are turned off, or the record couldn't be posted |
+| `/pr-quiz` by a challenged author | challenge quiz posted | quiz already open, or passed | no attempts left |
+
+```mermaid
+sequenceDiagram
+    actor Reviewer as Reviewer (@alice)
+    actor Author as Author (@bob)
+    participant PR as Pull request
+    participant Bot as PR Quiz Gate
+    Reviewer->>PR: comments "/pr-quiz challenge"
+    Bot->>PR: records the challenge, posts a quiz for @bob, pr-quiz pending
+    Author->>PR: ticks answers + Submit (one wrong)
+    Bot->>PR: shows the right answers, posts new questions
+    Author->>PR: ticks answers + Submit (all right)
+    Bot->>PR: pr-quiz turns green once the reviewers passed too
+```
+
+<details>
+<summary>What a challenge quiz looks like in Markdown</summary>
+
+```markdown
+## 🎯 PR Quiz challenge for @bob
+
+@bob, @alice challenged you to show that you understand this change. The pull request can't pass the quiz
+gate until you answer every question correctly. The questions were generated from the diff.
+
+- Tick **exactly one** answer per question, then tick **Submit answers** at the bottom.
+- Every answer must be correct. If one is wrong, you see the right answers and get new questions; nothing on
+  the pull request is dismissed.
+- Only @bob can answer this quiz.
+
+---
+
+**Q1.** …
+<sub>📄 `src/retry.ts`</sub>
+
+- [ ] A. …
+- [ ] B. …
+- [ ] C. …
+- [ ] D. …
+
+…
+
+- [ ] **Submit answers**: I answered from my own reading of the code, not by asking an AI for the answers.
+
+<sub>Attempt 1 · challenge · commit `1a2b3c4` · questions by `claude-opus-5-5` · PR Quiz</sub>
+```
+
+</details>
 
 ## Configuration
 
@@ -213,10 +303,11 @@ first step of the hardening described under [Limitations](#limitations).
 | `options-per-question` | `4` | Answer options per question (3-6). |
 | `verify-questions` | `true` | A second, blind Claude pass answers each question and drops ones it gets wrong or finds ambiguous. Roughly doubles token usage. |
 | `require-all-approvers` | `true` | `true`: every current approver must pass. `false`: one passing reviewer is enough. |
-| `max-attempts` | `5` | Failed attempts per reviewer per PR before no new quiz is generated (`0` = unlimited). |
-| `submit-reviews` | `true` | Bot submits *Changes requested* while a quiz is pending and *Approve* once it passes. |
+| `max-attempts` | `5` | Failed attempts per reviewer per PR, and per challenge for a challenged author, before no new quiz is generated (`0` = unlimited). |
+| `submit-reviews` | `true` | Bot submits *Changes requested* while a quiz or a challenge is pending and *Approve* once it passes. |
+| `allow-challenges` | `true` | Let reviewers whose pass could open the gate challenge an author of the change with `/pr-quiz challenge`. `false` turns challenges off and ignores existing ones. |
 | `status-context` | `pr-quiz` | Name of the commit status to require. |
-| `command` | `/pr-quiz` | Comment command to request a quiz. If you change it, change the `startsWith` filter in the workflow too. |
+| `command` | `/pr-quiz` | Comment command to request a quiz. `/pr-quiz challenge` and `/pr-quiz withdraw` use the same prefix. If you change it, change the `startsWith` filter in the workflow too. |
 | `ignore-paths` | | Extra globs to leave out of the quiz, comma or newline separated. Lockfiles, minified files, source maps and snapshots are always ignored. |
 | `max-diff-chars` | `200000` | Diff budget sent to Claude; bigger diffs are truncated per file. |
 | `include-file-context` | `true` | Also send the full post-change contents of modified files (within budget). |
@@ -255,6 +346,13 @@ Every run also writes a job summary.
 - **History you can't delete away.** Every new quiz carries the reviewer's failed-attempt count and the
   questions they have already seen, so deleting old quiz comments neither resets `max-attempts` nor brings
   back questions whose answers were shown.
+- **Challenges that stick.** A challenge is recorded as a *Comment* review by the bot, sealed like a quiz's
+  answer key. GitHub's UI and REST API offer no way to delete a submitted review, and a comment review can't be
+  dismissed. People with write access can edit it, so the bot checks the review's edit history on every run
+  and restores its own text. Every challenge quiz also carries a sealed copy of the author's challenges,
+  including those made while it was open or after it passed, which keeps them alive if a review is altered
+  beyond repair or goes missing. Deleting the command or the quiz comments only brings back a fresh quiz. If
+  the edit history can't be read, the status shows an error until the next event.
 - **Questions worth answering.** Claude is asked for questions about behavior, edge cases, risks and
   intent-vs-implementation, with plausible distractors of the same length and detail as the right answer.
   The bot shuffles the options itself, so the model can't be steered into a predictable answer position.
@@ -277,6 +375,9 @@ for small-to-medium PRs (two calls, the second largely served from the prompt ca
 around a minute of runtime. With a subscription token it uses your plan's quota instead. To reduce cost,
 use `model: claude-sonnet-5-5`, `effort: medium`, or `verify-questions: false`.
 
+A challenge costs one quiz per attempt, plus a follow-up quiz when new commits change the code after the
+author passed.
+
 ## Limitations
 
 - **Bots can't be requested reviewers on GitHub.** The bot therefore shows up in the reviewer list through
@@ -289,11 +390,22 @@ use `model: claude-sonnet-5-5`, `effort: medium`, or `verify-questions: false`.
   accounts: ticking someone else's quiz, pasting or rolling back quiz state, pruning edit history, deleting
   old quizzes. They don't stop someone who can run workflows. With the default `GITHUB_TOKEN`, every workflow
   in the repository acts as `github-actions[bot]`, the same identity as the quiz bot, and anyone with write
-  access can push a workflow that edits quiz comments as the bot or sets the `pr-quiz` status directly. To
-  harden it: use a dedicated GitHub App as the bot (edits by other workflows then count as someone else's),
-  select that App as the required source of the `pr-quiz` check in your ruleset, and protect
+  access can push a workflow that edits quiz comments or challenge reviews as the bot or sets the `pr-quiz`
+  status directly. To harden it: use a dedicated GitHub App as the bot (edits by other workflows then count as
+  someone else's), select that App as the required source of the `pr-quiz` check in your ruleset, and protect
   `.github/workflows/**` with CODEOWNERS and a ruleset so workflow changes need review.
-- Deleting every quiz comment of a reviewer resets their attempt history; deleting only some doesn't.
+- Deleting every quiz comment of a reviewer resets their attempt history; deleting only some doesn't. The same
+  holds for a challenged author's challenge quizzes.
+- **Challenges need write access.** Authors without write access, for example fork contributors, can't be
+  challenged yet: they can't tick boxes in the bot's comment. Bots and `web-flow` can't be challenged either.
+- **Challenges belong to their pull request.** Closing it and opening a new one starts without them.
+- Changing `state-secret` (or the Claude credential it is derived from) ends active challenges.
+- Challenges rest while the PR has no readable diff, and apply again once readable changes return.
+- Removing a challenge outright would take getting rid of the bot's record (for example by editing it and
+  deleting the bot's revisions from its edit history) and deleting every challenge quiz. A challenge whose quiz
+  could not be generated yet (for example while Claude is unavailable) depends on its record alone until the
+  quiz is posted.
+- Challenge records appear as comment reviews even with `submit-reviews: false`.
 - **The quiz is open book.** Every question is answerable from the diff (the verification pass makes sure of
   it), so a reviewer who pastes the quiz and the diff into an AI can pass. The attestation and the timing make
   that visible and deliberate, not impossible. A pass shows that the reviewer engaged with the change and put
@@ -308,7 +420,7 @@ use `model: claude-sonnet-5-5`, `effort: medium`, or `verify-questions: false`.
 npm ci
 npm test            # unit tests + end-to-end flows against an in-memory GitHub
 npm run typecheck
-npm run simulate    # narrated walk-through of the 9-step flow
+npm run simulate    # narrated walk-through of the reviewer flow, then a challenge of the author
 GITHUB_TOKEN=$(gh auth token) npm run smoke -- sindresorhus/ky 880   # real quiz from Claude for a public PR
 npm run build       # bundles to dist/index.cjs, which GitHub runs; commit it
 ```
