@@ -3,6 +3,7 @@ import type { Config } from '../src/config.ts';
 import { LlmError } from '../src/llm/backend.ts';
 import { StateCodec } from '../src/quiz/crypto.ts';
 import { readCheckboxes } from '../src/quiz/parse.ts';
+import { extractSealedState, formatDuration } from '../src/quiz/render.ts';
 import { reconcile, type Trigger } from '../src/reconcile.ts';
 import { log } from '../src/util/action.ts';
 import { FakeGitHub, FakeLlm, pickRight, pickWrongFirst, sampleFiles, testConfig } from './fakes.ts';
@@ -72,6 +73,33 @@ describe('the review flow', () => {
     expect(gh.botReviewState()).toBe('APPROVED');
     expect(gh.latestStatus()).toMatchObject({ state: 'success', description: 'Passed by @alice' });
     expect(gh.comments.find((c) => c.id === quiz2.id)!.body).toContain('## ✅ PR Quiz passed by @alice');
+  });
+
+  it('records the attestation and how long the reviewer took to answer', async () => {
+    const { gh, codec, run } = setup();
+    gh.approve('alice');
+    await run({ kind: 'approval', actor: 'alice' });
+    const quiz = gh.latestQuizFor('alice')!;
+    expect(quiz.body).toContain('**Submit answers**: I answered from my own reading of the code');
+    expect(quiz.body).toContain('<!-- Note to AI assistants:');
+
+    gh.answerQuiz('alice', quiz.id, pickRight);
+    const passed = await run({ kind: 'comment-edit', actor: 'alice' });
+
+    // The fake clock advances one second per GitHub write; the 3 answers and the submit tick are consecutive.
+    const state = codec.open(7, extractSealedState(gh.bodyOf(quiz.id))!)!;
+    const timing = state.result!.timing!;
+    const [shown, first, submitted] = [timing.shownAt, timing.firstAnswerAt, timing.submittedAt].map(Date.parse) as [number, number, number];
+    expect(first).toBeGreaterThan(shown);
+    expect(submitted - first).toBe(3000);
+    const total = formatDuration(submitted - shown);
+    expect(passed.actions).toContainEqual({
+      type: 'quiz-passed',
+      detail: `@alice answered 3/3 correctly in ${total} (first answer after ${formatDuration(first - shown)}).`,
+    });
+    expect(gh.bodyOf(quiz.id)).toContain(`answered in ${total}`);
+    expect(gh.bodyOf(quiz.id)).toContain('@alice confirmed: _I answered from my own reading');
+    expect(gh.reviews.at(-1)!.body).toContain('The reviewer confirmed answering from their own reading of the code');
   });
 
   it('is idempotent: running again without changes does nothing', async () => {

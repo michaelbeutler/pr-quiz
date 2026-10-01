@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { StateCodec } from '../src/quiz/crypto.ts';
 import { grade } from '../src/quiz/grade.ts';
 import { normalizeBody, parseOpenQuiz, readCheckboxes } from '../src/quiz/parse.ts';
-import { inlineText, isQuizBody, extractSealedState, renderQuiz } from '../src/quiz/render.ts';
+import { AI_NOTE, ATTESTATION, formatDuration, inlineText, isQuizBody, extractSealedState, renderQuiz } from '../src/quiz/render.ts';
 import type { QuizState } from '../src/quiz/types.ts';
 
 const baseState = (): QuizState => ({
@@ -89,6 +89,35 @@ describe('rendering and parsing', () => {
     expect(parseOpenQuiz(body, state, sealed).readable).toBe(false);
   });
 
+  it('asks AI assistants in the raw markdown not to answer, and puts the attestation on the submit checkbox', () => {
+    const state = { ...baseState(), attested: true };
+    const body = renderQuiz(state, sealed);
+    expect(body).toContain(AI_NOTE);
+    expect(body).toContain(`- [ ] **Submit answers**: ${ATTESTATION}`);
+    expect(readCheckboxes(body)).toHaveLength(9);
+    expect(parseOpenQuiz(renderQuiz(state, sealed, undefined, true), state, sealed)).toMatchObject({ intact: true, submitted: true });
+  });
+
+  it('keeps the old submit checkbox for quizzes created before the attestation', () => {
+    const body = renderQuiz(baseState(), sealed);
+    expect(body).toMatch(/- \[ \] \*\*Submit answers\*\*$/m);
+    expect(body).not.toContain(ATTESTATION);
+  });
+
+  it('shows the attestation and the answer time on a passed quiz', () => {
+    const state: QuizState = { ...baseState(), attested: true, status: 'passed' };
+    state.result = {
+      answers: [1, 0],
+      correct: [true, true],
+      gradedAt: '2026-09-30T12:02:00Z',
+      timing: { shownAt: '2026-09-30T12:00:00Z', firstAnswerAt: '2026-09-30T12:00:38Z', submittedAt: '2026-09-30T12:01:12Z' },
+    };
+    const body = renderQuiz(state, sealed);
+    expect(body).toContain(`@alice confirmed: _${ATTESTATION}_`);
+    expect(body).toContain('Attempt 1 · answered in 1 min 12 s ·');
+    expect(body).not.toContain(AI_NOTE);
+  });
+
   it('normalizes bodies', () => {
     expect(normalizeBody('a  \r\nb\t\r\n')).toBe('a\nb');
   });
@@ -106,6 +135,17 @@ describe('rendering and parsing', () => {
     expect(body).toContain('SECRET-EXPLANATION');
     expect(body).toContain('➡️ New quiz: https://example.test/quiz-2');
     expect(readCheckboxes(body)).toHaveLength(0);
+  });
+});
+
+describe('formatDuration', () => {
+  it('rounds to seconds and drops zero parts', () => {
+    expect(formatDuration(-5)).toBe('0 s');
+    expect(formatDuration(42_400)).toBe('42 s');
+    expect(formatDuration(185_000)).toBe('3 min 5 s');
+    expect(formatDuration(120_000)).toBe('2 min');
+    expect(formatDuration(7_440_000)).toBe('2 h 4 min');
+    expect(formatDuration(3_600_000)).toBe('1 h');
   });
 });
 
