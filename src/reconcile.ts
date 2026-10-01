@@ -22,12 +22,19 @@ import {
   extractSealedState,
   formatDuration,
   isQuizBody,
+  isWriting,
   joinList,
   listLogins,
   mention,
+  pendingReviewer,
   renderChallengeRecord,
   renderPlaceholder,
   renderQuiz,
+  renderReply,
+  renderWriting,
+  renderWritingFailed,
+  renderWritingStopped,
+  replyMarker,
   REVIEW_MARKER,
   skippedTargetLines,
   type ChallengeRecordInfo,
@@ -74,6 +81,8 @@ export interface ReconcileDeps {
   config: Config;
   llm: LlmBackend;
   now?: () => Date;
+  /** The workflow run doing the work, linked while a quiz is being written. */
+  runUrl?: string;
 }
 
 const TRUSTED_ASSOCIATIONS = new Set(['OWNER', 'MEMBER', 'COLLABORATOR']);
@@ -158,6 +167,11 @@ class Reconciliation {
   private generationPaused = false;
   private pr!: PullRequest;
   private reviews: Review[] = [];
+  private comments: IssueComment[] = [];
+  /** Placeholders of quizzes an earlier run did not finish, by reviewer; reused when the quiz is written again. */
+  private readonly slots = new Map<string, IssueComment>();
+  /** The status this run last published (to skip publishing the same status twice). */
+  private published: CommitStatus | null = null;
   private quizzes: QuizComment[] = [];
   /** Every known challenge on the pull request, withdrawn ones included. */
   private challenges: Challenge[] = [];
@@ -215,6 +229,11 @@ class Reconciliation {
       this.gh.getStatus(this.pr.head.sha, this.config.statusContext).catch(() => null),
     ]);
     this.reviews = reviews;
+    this.comments = comments;
+    for (const comment of comments) {
+      const reviewer = comment.user?.type === 'Bot' ? pendingReviewer(comment.body) : null;
+      if (reviewer) this.slots.set(key(reviewer), comment);
+    }
     this.committerLogins = committers;
     this.committers = new Set(committers.map(key));
     this.previousStatus = previousStatus;
@@ -233,7 +252,12 @@ class Reconciliation {
       await this.ensureQuizzes();
     } else if (this.verb === 'quiz') {
       await this.react(this.trigger.commandCommentId, 'confused');
+      await this.explain(
+        `${mention(this.trigger.actor ?? '')}, there is nothing to quiz on: this pull request only changes files the ` +
+          'quiz skips (ignored paths such as lockfiles, or binary files). An approval of the latest commit is enough.',
+      );
     }
+    await this.closeStoppedSlots();
     await this.linkFollowUps();
 
     await this.resolveEligibility();
@@ -610,6 +634,7 @@ class Reconciliation {
     const reject = async (reason: string): Promise<void> => {
       this.record('challenge-rejected', `${by} can't challenge: ${reason}`);
       await this.react(commandId, 'confused');
+      await this.explain(`${by}, you can't challenge here: ${reason}`);
     };
     if (!this.config.allowChallenges) return reject('challenges are turned off (allow-challenges: false).');
     if (commandId !== undefined && this.challenges.some((c) => c.commandCommentId === commandId)) {
@@ -631,13 +656,24 @@ class Reconciliation {
 
     let posted = 0;
     let failed = false;
+    const already: string[] = [];
     for (const login of logins) {
       // While the records can't be verified, a challenge that looks active may have been withdrawn: record it again.
-      const already =
+      if (
         !this.challengesUnverified &&
         this.activeChallenges(login).some((c) => loginsEqual(c.by, actor)) &&
-        (this.challengeMet(login) || !this.lockedOut(login));
-      if (already) continue;
+        (this.challengeMet(login) || !this.lockedOut(login))
+      ) {
+        const open = this.openQuiz(login, 'challenge');
+        already.push(
+          this.challengeMet(login)
+            ? `${mention(login)} already passed a challenge quiz on this version of the change.`
+            : open
+              ? `${mention(login)}'s challenge quiz is waiting for their answers: ${open.url}`
+              : `${mention(login)}'s challenge quiz is being prepared.`,
+        );
+        continue;
+      }
       const met = this.challengeMet(login);
       const record: ChallengeRecord = {
         v: 1,
@@ -664,6 +700,7 @@ class Reconciliation {
         const message = (error as Error).message;
         log.warning(`Could not post the challenge record: ${message}`);
         this.record('challenge-rejected', `Could not post the challenge record: ${message}`);
+        await this.explain(`${by}, the challenge could not be recorded: ${message}`);
         failed = true;
         break;
       }
@@ -674,6 +711,7 @@ class Reconciliation {
     if (posted) await this.react(commandId, 'rocket');
     if (failed) await this.react(commandId, 'confused');
     else if (!posted) await this.react(commandId, '+1'); // the actor had challenged them all already
+    if (!failed && !posted && already.length) await this.explain(`${by}, you already challenged them. ${already.join(' ')}`);
   }
 
   /** `/pr-quiz withdraw [@author …]`: only the reviewer who challenged can end their challenges. */
@@ -683,6 +721,7 @@ class Reconciliation {
     const reject = async (reason: string): Promise<void> => {
       this.record('withdraw-rejected', `${by} can't withdraw: ${reason}`);
       await this.react(commandId, 'confused');
+      await this.explain(`${by}, nothing was withdrawn: ${reason}`);
     };
     if (!this.config.allowChallenges) return reject('challenges are turned off (allow-challenges: false).');
     if (commandId !== undefined && this.withdrawCommands.some((w) => w.commandCommentId === commandId)) {
@@ -819,9 +858,12 @@ class Reconciliation {
     quiz.body = updated.body ?? body;
   }
 
-  /** Posts a placeholder first so the state can be sealed together with the id of the comment it lives in. */
-  private async post(state: QuizState): Promise<QuizComment> {
-    const placeholder = await this.gh.createComment(this.prNumber, renderPlaceholder(state.reviewer, !!state.challenge));
+  /**
+   * Posts a placeholder first (unless the quiz goes into one already shown while it was written), so the state can be
+   * sealed together with the id of the comment it lives in.
+   */
+  private async post(state: QuizState, slot?: IssueComment): Promise<QuizComment> {
+    const placeholder = slot ?? (await this.gh.createComment(this.prNumber, renderPlaceholder(state.reviewer, !!state.challenge)));
     state.commentId = placeholder.id;
     const comment = await this.gh.updateComment(placeholder.id, this.render(state));
     const quiz: QuizComment = {
@@ -1117,18 +1159,35 @@ class Reconciliation {
         if (isCommander) {
           this.record('quiz-skipped', `${who} cannot take the quiz (no write access).`);
           await this.react(this.trigger.commandCommentId, 'confused');
+          await this.explain(`${who}, you can't take a quiz here: you don't have write access to this repository.`);
         } else {
           log.info(`${who} is an author of the change or has no write access, so their approval does not start a quiz.`);
+          await this.explainIgnoredApproval(login);
         }
         continue;
       }
-      if (this.passStatus(login, practice).status !== 'none' || this.openQuiz(login)) {
-        if (isCommander) await this.react(this.trigger.commandCommentId, '+1');
+      const passed = this.passStatus(login, practice);
+      const open = this.openQuiz(login);
+      if (passed.status !== 'none' || open) {
+        if (isCommander) {
+          await this.react(this.trigger.commandCommentId, '+1');
+          const what = practice ? 'practice quiz' : 'quiz';
+          await this.explain(
+            open
+              ? `${who}, your ${what} is waiting for your answers: ${open.url}`
+              : `${who}, you already passed the ${what} on this version of the change: ${passed.quiz!.url}`,
+          );
+        }
         continue;
       }
       if (this.config.maxAttempts > 0 && this.attemptHistory(login).failed >= this.config.maxAttempts) {
         await this.lockOut(login);
-        if (isCommander) await this.react(this.trigger.commandCommentId, 'confused');
+        if (isCommander) {
+          await this.react(this.trigger.commandCommentId, 'confused');
+          await this.explain(
+            `${who}, you have used all ${this.config.maxAttempts} attempts on this pull request, so no new quiz is generated.`,
+          );
+        }
         continue;
       }
       if (this.generationPausedFor(login)) continue;
@@ -1145,13 +1204,28 @@ class Reconciliation {
 
   /** A challenged author gets a challenge quiz (never a practice quiz) until one passes on the current code. */
   private async ensureChallengeQuiz(login: string, isCommander: boolean): Promise<void> {
-    if (this.challengeMet(login) || this.openQuiz(login, 'challenge')) {
-      if (isCommander) await this.react(this.trigger.commandCommentId, '+1');
+    const who = mention(login);
+    const open = this.openQuiz(login, 'challenge');
+    if (this.challengeMet(login) || open) {
+      if (isCommander) {
+        await this.react(this.trigger.commandCommentId, '+1');
+        await this.explain(
+          open
+            ? `${who}, your challenge quiz is waiting for your answers: ${open.url}`
+            : `${who}, you already passed the challenge quiz on this version of the change.`,
+        );
+      }
       return;
     }
     if (this.lockedOut(login)) {
       await this.lockOutChallenge(login);
-      if (isCommander) await this.react(this.trigger.commandCommentId, 'confused');
+      if (isCommander) {
+        await this.react(this.trigger.commandCommentId, 'confused');
+        await this.explain(
+          `${who}, you have used all ${this.config.maxAttempts} attempts on this challenge, so no new quiz is generated. ` +
+            `A reviewer can comment \`${this.config.command} challenge ${who}\` for new attempts.`,
+        );
+      }
       return;
     }
     if (this.generationPausedFor(login)) return;
@@ -1242,6 +1316,52 @@ class Reconciliation {
   }
 
   private async createQuiz(login: string, kind: QuizKind): Promise<void> {
+    // Visible at once: a placeholder that turns into the quiz, and a status saying what the run is doing.
+    const writing = { challenge: kind === 'challenge', questions: this.config.questionCount, runUrl: this.deps.runUrl };
+    const slot = await this.openSlot(login, renderWriting(login, writing));
+    await this.publishStatus({
+      state: 'pending',
+      context: this.config.statusContext,
+      description: `Writing a ${kind === 'challenge' ? 'challenge quiz' : 'quiz'} for ${mention(login)}…`,
+      target_url: this.deps.runUrl ?? slot.html_url,
+    });
+    try {
+      await this.writeQuiz(login, kind, slot);
+    } catch (error) {
+      const body = renderWritingFailed(login, { ...writing, reason: (error as Error).message, command: this.config.command });
+      await this.gh.updateComment(slot.id, body).catch((e: Error) => log.warning(`Could not update ${slot.html_url}: ${e.message}`));
+      throw error;
+    }
+  }
+
+  /** The comment a quiz is written into: the placeholder an earlier run left for this reviewer, or a new one. */
+  private async openSlot(login: string, body: string): Promise<IssueComment> {
+    const left = this.slots.get(key(login));
+    this.slots.delete(key(login));
+    if (left) return left.body === body ? left : await this.gh.updateComment(left.id, body);
+    return await this.gh.createComment(this.prNumber, body);
+  }
+
+  /** Placeholders still saying "writing" belong to a run that stopped early: say so, instead of spinning forever. */
+  private async closeStoppedSlots(): Promise<void> {
+    for (const slot of this.slots.values()) {
+      const reviewer = pendingReviewer(slot.body);
+      if (!reviewer || !isWriting(slot.body)) continue;
+      const challenge = (slot.body ?? '').includes('PR Quiz challenge');
+      const body = renderWritingStopped(reviewer, {
+        challenge,
+        questions: this.config.questionCount,
+        command: this.config.command,
+      });
+      await this.gh.updateComment(slot.id, body).then(
+        () => this.record('quiz-stopped', `Writing a quiz for ${mention(reviewer)} stopped in an earlier run: ${slot.html_url}`),
+        (e: Error) => log.warning(`Could not update ${slot.html_url}: ${e.message}`),
+      );
+    }
+    this.slots.clear();
+  }
+
+  private async writeQuiz(login: string, kind: QuizKind, slot: IssueComment): Promise<void> {
     const lastPass = this.quizzesOf(login)
       .filter((q) => q.state.status === 'passed' && quizKind(q.state) === kind)
       .at(-1);
@@ -1306,7 +1426,7 @@ class Reconciliation {
       model: this.deps.llm.model,
       createdAt: this.now(),
     };
-    const quiz = await this.post(state);
+    const quiz = await this.post(state, slot);
     const verified = this.config.verifyQuestions ? `, ${generated.verifiedCount} verified, ${generated.droppedCount} dropped` : '';
     this.record(
       'quiz-posted',
@@ -1437,7 +1557,7 @@ class Reconciliation {
   }
 
   private async publishStatus(status: CommitStatus): Promise<void> {
-    const current = this.previousStatus;
+    const current = this.published ?? this.previousStatus;
     const description = status.description.length > 140 ? status.description.slice(0, 139) + '…' : status.description;
     if (
       current &&
@@ -1448,6 +1568,7 @@ class Reconciliation {
       return;
     }
     await this.gh.setStatus(this.pr.head.sha, { ...status, description });
+    this.published = { ...status, description };
     this.record('status', `${status.context}: ${status.state} (${description})`);
   }
 
@@ -1531,6 +1652,45 @@ class Reconciliation {
       this.record('bot-review-dismissed', message);
     } catch (error) {
       log.warning(`Could not dismiss the bot's own review: ${(error as Error).message}`);
+    }
+  }
+
+  /** Answers the command comment of this run in one line, when its outcome isn't a new quiz. */
+  private async explain(text: string): Promise<void> {
+    const id = this.trigger.commandCommentId;
+    if (this.trigger.kind !== 'command' || id === undefined) return;
+    const quote = this.comments.find((c) => c.id === id)?.body?.split(/\r?\n/, 1)[0];
+    await this.reply(`command-${id}`, text, quote);
+  }
+
+  /** Tells an approver once why their approval can't count, when it was this run's trigger. */
+  private async explainIgnoredApproval(login: string): Promise<void> {
+    if (this.trigger.kind !== 'approval' || !loginsEqual(this.trigger.actor, login)) return;
+    const review = this.reviews.filter((r) => r.user && loginsEqual(r.user.login, login) && r.state === 'APPROVED').at(-1);
+    if (!review) return;
+    const who = mention(login);
+    const author = this.isAuthor(login);
+    const why = author
+      ? 'you are an author of this change (you opened the pull request or committed to it)'
+      : "you don't have write access to this repository";
+    const practice = author && (await this.canPush(login)) ? ` You can still comment \`${this.config.command}\` for a practice quiz.` : '';
+    await this.reply(
+      `review-${review.id}`,
+      `${who}, your approval doesn't start a quiz and doesn't count toward the gate, because ${why}. ` +
+        `Another reviewer needs to approve and pass a quiz.${practice}`,
+    );
+  }
+
+  /** Posts a reply at most once per key, so re-runs of the same event stay quiet. */
+  private async reply(replyKey: string, text: string, quote?: string): Promise<void> {
+    const marker = replyMarker(replyKey);
+    if (this.comments.some((c) => c.user?.type === 'Bot' && c.body?.includes(marker))) return;
+    try {
+      const comment = await this.gh.createComment(this.prNumber, renderReply(replyKey, text, quote));
+      this.comments.push(comment);
+      this.record('replied', text);
+    } catch (error) {
+      log.warning(`Could not reply: ${(error as Error).message}`);
     }
   }
 

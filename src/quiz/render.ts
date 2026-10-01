@@ -93,6 +93,80 @@ export function renderPlaceholder(reviewer: string, challenge = false): string {
   return `⏳ Preparing a PR Quiz${challenge ? ' challenge' : ''} for ${mention(reviewer)}…`;
 }
 
+/** Marks the comment a quiz is being written into, so a later run can reuse it. Matches no other marker. */
+export function pendingMarker(reviewer: string): string {
+  return `<!-- pr-quiz:pending:${reviewer} -->`;
+}
+
+const PENDING_RE = /<!-- pr-quiz:pending:([^ ]+) -->/;
+
+/** Login a quiz is (or was) being written for, if the body is such a placeholder. */
+export function pendingReviewer(body: string | null | undefined): string | null {
+  return body ? (PENDING_RE.exec(body)?.[1] ?? null) : null;
+}
+
+export interface WritingInfo {
+  challenge: boolean;
+  questions: number;
+  /** The workflow run writing the quiz. */
+  runUrl?: string;
+}
+
+const WRITING_HEADING = '⏳ **Writing';
+
+function runLink(runUrl: string | undefined): string {
+  return runUrl ? ` [Follow the run](${runUrl}).` : '';
+}
+
+/** Shown while Claude writes the questions; the same comment then turns into the quiz. */
+export function renderWriting(reviewer: string, info: WritingInfo): string {
+  return [
+    pendingMarker(reviewer),
+    `${WRITING_HEADING} a ${info.challenge ? 'PR Quiz challenge' : 'PR Quiz'} for ${mention(reviewer)}…**`,
+    '',
+    `Claude is reading the change and writing ${info.questions === 1 ? 'a question' : `${info.questions} questions`}. ` +
+      `This usually takes 1–2 minutes; this comment turns into the quiz.${runLink(info.runUrl)}`,
+  ].join('\n');
+}
+
+/** Whether a placeholder still says the quiz is being written (as opposed to having failed). */
+export function isWriting(body: string | null | undefined): boolean {
+  return !!body && body.includes(WRITING_HEADING);
+}
+
+/** Generation failed: say why, and when it is tried again. The next attempt reuses this comment. */
+export function renderWritingFailed(reviewer: string, info: WritingInfo & { reason: string; command: string }): string {
+  return [
+    pendingMarker(reviewer),
+    `⚠️ **Could not write a ${info.challenge ? 'PR Quiz challenge' : 'PR Quiz'} for ${mention(reviewer)}**`,
+    '',
+    `> ${inlineText(info.reason, 300)}`,
+    '',
+    `It is tried again on the next approval or push, or when someone comments \`${info.command}\`.${runLink(info.runUrl)}`,
+  ].join('\n');
+}
+
+/** A run stopped (cancelled, timed out) while writing this quiz. */
+export function renderWritingStopped(reviewer: string, info: WritingInfo & { command: string }): string {
+  return [
+    pendingMarker(reviewer),
+    `⚠️ **Writing a ${info.challenge ? 'PR Quiz challenge' : 'PR Quiz'} for ${mention(reviewer)} stopped before it finished**`,
+    '',
+    `The workflow run ended early (cancelled or timed out). It is tried again on the next approval or push, ` +
+      `or when someone comments \`${info.command}\`.`,
+  ].join('\n');
+}
+
+/** Marks the bot's one reply to a command comment or an approval. */
+export function replyMarker(key: string): string {
+  return `<!-- pr-quiz:reply:${key} -->`;
+}
+
+/** A short answer to a command (or an approval) that did not start a new quiz, explaining why. */
+export function renderReply(key: string, text: string, quote?: string): string {
+  return [replyMarker(key), ...(quote ? [`> ${inlineText(quote, 200)}`, ''] : []), text].join('\n');
+}
+
 function title(state: QuizState): string {
   return state.challenge ? 'PR Quiz challenge' : 'PR Quiz';
 }

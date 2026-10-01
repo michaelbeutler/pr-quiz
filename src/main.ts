@@ -63,7 +63,10 @@ async function run(): Promise<void> {
     `PR #${prNumber} · trigger: ${trigger.kind}${verb}${trigger.actor ? ` by ${trigger.actor}` : ''} · questions by ${llm.label} (${llm.model})`,
   );
 
-  const result = await reconcile({ gh, codec, config, llm }, prNumber, trigger);
+  const { GITHUB_SERVER_URL: server, GITHUB_RUN_ID: runId, GITHUB_RUN_ATTEMPT: attempt } = process.env;
+  const runUrl = server && runId ? `${server}/${repository}/actions/runs/${runId}${attempt ? `/attempts/${attempt}` : ''}` : undefined;
+
+  const result = await reconcile({ gh, codec, config, llm, runUrl }, prNumber, trigger);
   log.info(`Gate: ${result.gate} · ${result.description}`);
   setOutput('gate', result.gate);
   setOutput('actions', JSON.stringify(result.actions));

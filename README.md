@@ -192,10 +192,15 @@ first step of the hardening described under [Limitations](#limitations).
   invalidated and reposted with the same questions, without counting as an attempt.
 - A wrong answer dismisses your approval, re-requests your review, and posts new questions. The old quiz
   shows the correct answers and explanations.
+- The quiz comment appears as soon as the run starts ("⏳ Writing a PR Quiz for @you…", with a link to the
+  run) and turns into the quiz when the questions are ready, usually after 1–2 minutes. Meanwhile the
+  `pr-quiz` check says "Writing a quiz for @you…". If writing fails, the same comment shows the error and the
+  next approval, push or `/pr-quiz` tries again.
 - To take a quiz without approving first, comment `/pr-quiz`. This is also how quizzes work on pull
-  requests from forks (see [Limitations](#limitations)).
+  requests from forks (see [Limitations](#limitations)). If no new quiz is needed (yours is already open,
+  you already passed, you have no write access), the bot replies with the reason and a link.
 - The PR author and anyone who authored or committed one of its commits can't pass the gate: their
-  approvals neither pass nor block it. Merge commits (e.g. from "Update branch") don't count as authorship.
+  approvals neither pass nor block it, and the bot replies once to such an approval to say so. Merge commits (e.g. from "Update branch") don't count as authorship.
   Authors with write access can still comment `/pr-quiz` for a practice quiz; it doesn't count toward the
   gate, and a wrong answer changes nothing on the pull request. To make an author's quiz count, challenge
   them (see [Challenge the author](#challenge-the-author)).
@@ -236,7 +241,8 @@ correctly, however many reviewers have passed.
 - **Recorded so it sticks:** see [How it works](#how-it-works).
 
 The bot reacts to each command with 👀 first, then with the result. If a command gets no 👀, comment it
-again. Rejections post no comment; the reason is in the job summary.
+again. When a command doesn't start a new quiz, the bot also replies once, in one line, saying why (for
+example "@alice, you already challenged them. @bob's challenge quiz is waiting for their answers: …").
 
 | Command | 🚀 | 👍 | 😕 |
 | --- | --- | --- | --- |

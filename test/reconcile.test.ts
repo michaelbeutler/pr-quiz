@@ -9,12 +9,14 @@ import { reconcile, type Trigger } from '../src/reconcile.ts';
 import { log } from '../src/util/action.ts';
 import { FakeGitHub, FakeLlm, pickRight, pickWrongFirst, sampleFiles, testConfig } from './fakes.ts';
 
+const RUN_URL = 'https://github.com/acme/shop/actions/runs/99';
+
 function setup(config: Partial<Config> = {}) {
   const gh = new FakeGitHub();
   const llm = new FakeLlm();
   const cfg = testConfig(config);
   const codec = new StateCodec(cfg.stateSecret, 4242);
-  const run = (trigger: Trigger = { kind: 'manual' }) => reconcile({ gh, codec, config: cfg, llm }, 7, trigger);
+  const run = (trigger: Trigger = { kind: 'manual' }) => reconcile({ gh, codec, config: cfg, llm, runUrl: RUN_URL }, 7, trigger);
   return { gh, llm, codec, run };
 }
 
@@ -1647,5 +1649,126 @@ describe('challenging the author', () => {
     paged.ctx.gh.truncatedReviewHistory.clear();
     expect((await paged.ctx.run({ kind: 'comment-edit', actor: 'bob' })).gate).not.toBe('passed');
     expect(paged.ctx.gh.latestStatus()?.description).not.toContain('Could not verify');
+  });
+});
+
+describe('feedback while working', () => {
+  const replies = (gh: FakeGitHub) => gh.comments.filter((c) => c.body?.includes('<!-- pr-quiz:reply:'));
+
+  it('shows the quiz comment and a "writing" status before Claude answers, then fills in the quiz', async () => {
+    const { gh, run } = setup();
+    gh.approve('alice');
+    const result = await run({ kind: 'approval', actor: 'alice' });
+    const quiz = gh.latestQuizFor('alice')!;
+    const first = quiz.edits.at(-1)!; // oldest revision: what reviewers saw while the questions were written
+    expect(first.body).toContain('⏳ **Writing a PR Quiz for @alice…**');
+    expect(first.body).toContain(`[Follow the run](${RUN_URL})`);
+    expect(gh.statuses.map((s) => s.description)).toContain('Writing a quiz for @alice…');
+    expect(gh.statuses.find((s) => s.description.startsWith('Writing'))?.target_url).toBe(RUN_URL);
+    expect(gh.latestStatus()?.description).toBe('Waiting for @alice to answer the quiz');
+    expect(quiz.body).not.toContain('pr-quiz:pending');
+    expect(types(result)).toEqual(expect.arrayContaining(['status', 'quiz-posted']));
+  });
+
+  it('turns the placeholder into the error when generation fails, and reuses it on the retry', async () => {
+    const { gh, run, llm } = setup();
+    llm.failGeneration = new LlmError('Anthropic API rejected the credentials (401).', false);
+    gh.approve('alice');
+    await run({ kind: 'approval', actor: 'alice' });
+    const placeholder = gh.comments.find((c) => c.body?.includes('<!-- pr-quiz:pending:alice -->'))!;
+    expect(placeholder.body).toContain('⚠️ **Could not write a PR Quiz for @alice**');
+    expect(placeholder.body).toContain('401');
+    expect(placeholder.body).toContain('`/pr-quiz`');
+
+    await run({ kind: 'comment-edit' }); // not a retry trigger: the error stays as it is
+    expect(gh.bodyOf(placeholder.id)).toContain('Could not write');
+
+    llm.failGeneration = null;
+    await run({ kind: 'push' });
+    expect(gh.latestQuizFor('alice')!.id).toBe(placeholder.id);
+    expect(gh.comments.filter((c) => c.body?.includes('pr-quiz:pending'))).toHaveLength(0);
+  });
+
+  it('says so when an earlier run stopped while writing, and writes the quiz into that comment later', async () => {
+    const { gh, run } = setup();
+    const left = gh.postAsBot('<!-- pr-quiz:pending:alice -->\n⏳ **Writing a PR Quiz for @alice…**\n\nClaude is reading…');
+    const result = await run({ kind: 'push' });
+    expect(types(result)).toContain('quiz-stopped');
+    expect(gh.bodyOf(left.id)).toContain('stopped before it finished');
+    expect(types(await run({ kind: 'push' }))).not.toContain('quiz-stopped');
+
+    gh.approve('alice');
+    await run({ kind: 'approval', actor: 'alice' });
+    expect(gh.latestQuizFor('alice')!.id).toBe(left.id);
+  });
+
+  it('explains a /pr-quiz that does not start a new quiz, once per command', async () => {
+    const ctx = setup();
+    const { gh, run } = ctx;
+    gh.approve('alice');
+    await run();
+    const quiz = gh.latestQuizFor('alice')!;
+    const { id, trigger } = await comment(ctx, 'alice', '/pr-quiz');
+    expect(gh.reactionsOn(id)).toContain('+1');
+    expect(replies(gh)).toHaveLength(1);
+    expect(replies(gh)[0]!.body).toContain(`@alice, your quiz is waiting for your answers: ${quiz.html_url}`);
+    expect(replies(gh)[0]!.body).toContain('> /pr-quiz');
+    await run(trigger); // a re-run of the same event
+    expect(replies(gh)).toHaveLength(1);
+
+    gh.answerQuiz('alice', quiz.id, pickRight);
+    await run();
+    await comment(ctx, 'alice', '/pr-quiz');
+    expect(replies(gh).at(-1)!.body).toContain('@alice, you already passed the quiz on this version of the change');
+
+    gh.permissions.set('reader', 'read');
+    await comment(ctx, 'reader', '/pr-quiz');
+    expect(replies(gh).at(-1)!.body).toContain("@reader, you can't take a quiz here: you don't have write access");
+  });
+
+  it('explains why there is nothing to quiz on', async () => {
+    const ctx = setup();
+    ctx.gh.push([sampleFiles()[1]!]); // lockfile only
+    await comment(ctx, 'alice', '/pr-quiz');
+    expect(replies(ctx.gh).at(-1)!.body).toContain('@alice, there is nothing to quiz on');
+  });
+
+  it('explains once why an approval by an author of the change does not count', async () => {
+    const { gh, run } = setup();
+    gh.push(sampleFiles(2), 'bob');
+    gh.approve('bob');
+    await run({ kind: 'approval', actor: 'bob' });
+    expect(replies(gh)).toHaveLength(1);
+    expect(replies(gh)[0]!.body).toContain("@bob, your approval doesn't start a quiz");
+    expect(replies(gh)[0]!.body).toContain('you are an author of this change');
+    expect(replies(gh)[0]!.body).toContain('practice quiz');
+    await run({ kind: 'approval', actor: 'bob' });
+    await run({ kind: 'push' });
+    expect(replies(gh)).toHaveLength(1);
+  });
+
+  it('explains rejected and repeated challenges and withdrawals', async () => {
+    const ctx = setup();
+    const { gh } = ctx;
+    await comment(ctx, 'author', '/pr-quiz challenge @bob');
+    expect(replies(gh).at(-1)!.body).toContain("@author, you can't challenge here:");
+
+    await comment(ctx, 'alice', '/pr-quiz challenge');
+    const quiz = gh.latestQuizFor('author')!;
+    await comment(ctx, 'alice', '/pr-quiz challenge');
+    expect(replies(gh).at(-1)!.body).toContain(`@alice, you already challenged them. @author's challenge quiz is waiting for their answers: ${quiz.html_url}`);
+
+    await comment(ctx, 'bob', '/pr-quiz withdraw');
+    expect(replies(gh).at(-1)!.body).toContain('@bob, nothing was withdrawn: only the reviewer who challenged can withdraw.');
+
+    await comment(ctx, 'author', '/pr-quiz');
+    expect(replies(gh).at(-1)!.body).toContain(`@author, your challenge quiz is waiting for your answers: ${quiz.html_url}`);
+  });
+
+  it('does not reply when a command starts a quiz', async () => {
+    const ctx = setup();
+    const { id } = await comment(ctx, 'alice', '/pr-quiz');
+    expect(ctx.gh.reactionsOn(id)).toContain('rocket');
+    expect(replies(ctx.gh)).toHaveLength(0);
   });
 });
