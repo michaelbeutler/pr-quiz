@@ -1317,6 +1317,15 @@ class Reconciliation {
 
   // --- Gate, status and bot review -----------------------------------------------------------------------------
 
+  /** Reviewers alone: every active challenge is required on top, however `require-all-approvers` is set. */
+  private reviewersSatisfied(): boolean {
+    if (!this.passes().length) return false;
+    if (!this.config.requireAllApprovers) return true;
+    return this.activeApprovers()
+      .filter((login) => this.eligibility.get(key(login)) === true)
+      .every((login) => this.passStatus(login).status === 'valid');
+  }
+
   private evaluateGate(): CommitStatus {
     const context = this.config.statusContext;
     const eligibleApprovers = this.activeApprovers().filter((login) => this.eligibility.get(key(login)) === true);
@@ -1332,8 +1341,7 @@ class Reconciliation {
     const passers = this.passes();
     const pendingApprovers = eligibleApprovers.filter((login) => this.passStatus(login).status !== 'valid');
     const open = this.openQuizzes();
-    // Reviewers alone: every active challenge is required on top, however `require-all-approvers` is set.
-    const satisfied = passers.length > 0 && (!this.config.requireAllApprovers || pendingApprovers.length === 0);
+    const satisfied = this.reviewersSatisfied();
     const unmet = this.unmetChallengees();
     const passedBy = `Passed by ${listLogins(passers.map((q) => q.state.reviewer))}`;
 
@@ -1509,6 +1517,9 @@ class Reconciliation {
     }
 
     if (!blocking && latest?.state === 'APPROVED') {
+      // Only the challenge records could not be read (a transient API error): the error status already blocks the
+      // merge, and the next healthy run settles it, so the approval is not withdrawn on a guess.
+      if (this.challengesUnverified && this.changes.hasReadableChanges && this.reviewersSatisfied()) return;
       await this.dismissBotReview(latest, 'PR Quiz: the approval is no longer backed by a passed quiz.');
     }
   }

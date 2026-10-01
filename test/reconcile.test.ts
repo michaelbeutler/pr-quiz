@@ -1579,6 +1579,37 @@ describe('challenging the author', () => {
     expect(other.gh.latestStatus()?.state).toBe('success');
   });
 
+  it("keeps the bot's approval while the challenge records can't be verified", async () => {
+    const ctx = setup();
+    const { gh } = ctx;
+    await passReviewer(ctx);
+    await comment(ctx, 'alice', '/pr-quiz challenge');
+    gh.answerQuiz('author', gh.latestQuizFor('author')!.id, pickRight);
+    expect((await ctx.run()).gate).toBe('passed');
+    expect(gh.botReviewState()).toBe('APPROVED');
+    const reviews = gh.reviews.length;
+
+    // A transient API error blocks the merge through the status but doesn't withdraw the approval on a guess.
+    gh.failReviewEdits = true;
+    const failed = await ctx.run();
+    expect(failed.gate).toBe('error');
+    expect(types(failed)).not.toContain('bot-review-dismissed');
+    expect(gh.botReviewState()).toBe('APPROVED');
+
+    gh.failReviewEdits = false;
+    const healthy = await ctx.run();
+    expect(healthy.gate).toBe('passed');
+    expect(types(healthy)).not.toContain('bot-approved');
+    expect(gh.reviews).toHaveLength(reviews);
+
+    // A reviewer who no longer approves still withdraws the bot's approval, records readable or not.
+    gh.failReviewEdits = true;
+    gh.requestChanges('alice');
+    const withdrawn = await ctx.run({ kind: 'review', actor: 'alice' });
+    expect(types(withdrawn)).toContain('bot-review-dismissed');
+    expect(gh.botReviewState()).toBe('DISMISSED');
+  });
+
   it("fails closed when a challenge record that no quiz copies can't be checked", async () => {
     // The challenge quiz was never generated, so the record is the only trace of the challenge.
     const unquizzed = async () => {

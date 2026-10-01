@@ -21487,6 +21487,12 @@ var Reconciliation = class {
     );
   }
   // --- Gate, status and bot review -----------------------------------------------------------------------------
+  /** Reviewers alone: every active challenge is required on top, however `require-all-approvers` is set. */
+  reviewersSatisfied() {
+    if (!this.passes().length) return false;
+    if (!this.config.requireAllApprovers) return true;
+    return this.activeApprovers().filter((login) => this.eligibility.get(key(login)) === true).every((login) => this.passStatus(login).status === "valid");
+  }
   evaluateGate() {
     const context = this.config.statusContext;
     const eligibleApprovers = this.activeApprovers().filter((login) => this.eligibility.get(key(login)) === true);
@@ -21497,7 +21503,7 @@ var Reconciliation = class {
     const passers = this.passes();
     const pendingApprovers = eligibleApprovers.filter((login) => this.passStatus(login).status !== "valid");
     const open = this.openQuizzes();
-    const satisfied = passers.length > 0 && (!this.config.requireAllApprovers || pendingApprovers.length === 0);
+    const satisfied = this.reviewersSatisfied();
     const unmet = this.unmetChallengees();
     const passedBy = `Passed by ${listLogins(passers.map((q) => q.state.reviewer))}`;
     if (satisfied && !unmet.length && !this.challengesUnverified) {
@@ -21652,6 +21658,7 @@ ${waiting.join("\n")}`;
       return;
     }
     if (!blocking && latest?.state === "APPROVED") {
+      if (this.challengesUnverified && this.changes.hasReadableChanges && this.reviewersSatisfied()) return;
       await this.dismissBotReview(latest, "PR Quiz: the approval is no longer backed by a passed quiz.");
     }
   }
