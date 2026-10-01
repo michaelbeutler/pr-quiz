@@ -60,6 +60,8 @@ export interface QuizState {
   files?: Record<string, string>;
   /** 'incremental' quizzes only cover files that changed since the reviewer last passed. */
   scope: 'full' | 'incremental';
+  /** Requested by an author of the change: a pass doesn't count toward the gate and a failure dismisses nothing. */
+  practice?: boolean;
   status: QuizStatus;
   questions: Question[];
   model: string;

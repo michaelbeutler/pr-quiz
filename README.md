@@ -189,8 +189,10 @@ first step of the hardening described under [Limitations](#limitations).
   shows the correct answers and explanations.
 - To take a quiz without approving first, comment `/pr-quiz`. This is also how quizzes work on pull
   requests from forks (see [Limitations](#limitations)).
-- The PR author and anyone who authored or committed one of its commits can't take the quiz; their
-  approvals neither pass nor block the gate.
+- The PR author and anyone who authored or committed one of its commits can't pass the gate: their
+  approvals neither pass nor block it. Merge commits (e.g. from "Update branch") don't count as authorship.
+  Authors with write access can still comment `/pr-quiz` for a practice quiz; it doesn't count toward the
+  gate, and a wrong answer changes nothing on the pull request.
 - If new commits change the code after you passed, and your approval is still active, you get a short
   follow-up quiz about the files that changed. A rebase that doesn't change the diff keeps your pass.
 - Changes a quiz can't cover (ignored files like lockfiles, binary files, diffs too large for GitHub to show)

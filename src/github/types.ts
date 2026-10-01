@@ -89,7 +89,7 @@ export interface GitHubApi {
   getCommentEdits(commentNodeId: string): Promise<CommentHistory>;
   /** Whether the user can push to the repository (admin, maintain, write or a custom role based on them). */
   hasWriteAccess(login: string): Promise<boolean>;
-  /** GitHub users who authored or committed any commit of the pull request. */
+  /** GitHub users who authored or committed any non-merge commit of the pull request. */
   listCommitters(pr: number): Promise<string[]>;
   addReaction(commentId: number, content: '+1' | 'eyes' | 'confused' | 'rocket'): Promise<void>;
 }

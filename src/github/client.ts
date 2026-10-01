@@ -270,12 +270,15 @@ export class RestGitHub implements GitHubApi {
   }
 
   async listCommitters(pr: number): Promise<string[]> {
-    const commits = await this.paginate<{ author: { login: string } | null; committer: { login: string } | null }>(
-      `${this.repoPath}/pulls/${pr}/commits`,
-      3,
-    );
+    const commits = await this.paginate<{
+      author: { login: string } | null;
+      committer: { login: string } | null;
+      parents?: unknown[];
+    }>(`${this.repoPath}/pulls/${pr}/commits`, 3);
     const logins = new Set<string>();
     for (const commit of commits) {
+      // Merging the base branch in (e.g. "Update branch") brings in other people's work, not your own.
+      if ((commit.parents?.length ?? 1) > 1) continue;
       if (commit.author?.login) logins.add(commit.author.login);
       if (commit.committer?.login) logins.add(commit.committer.login);
     }

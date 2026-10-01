@@ -98,6 +98,7 @@ class Reconciliation {
   private readonly prNumber: number;
   private readonly trigger: Trigger;
   private readonly eligibility = new Map<string, boolean>();
+  private readonly writeAccess = new Map<string, boolean>();
   private committers = new Set<string>();
   private previousStatus: CommitStatus | null = null;
   /** Generation was skipped because an earlier attempt failed and this trigger is not a retry. */
@@ -248,9 +249,14 @@ class Reconciliation {
    * A pass is valid for the code the quiz covered. If only ignored or binary files changed since (which a quiz
    * can't cover), the reviewer must approve the latest commit again for the pass to keep counting.
    */
-  private passStatus(login: string): { status: PassStatus; quiz?: QuizComment } {
+  private passStatus(login: string, includePractice = false): { status: PassStatus; quiz?: QuizComment } {
     const quiz = this.quizzesOf(login)
-      .filter((q) => q.state.status === 'passed' && q.state.fingerprint === this.changes.fingerprint)
+      .filter(
+        (q) =>
+          q.state.status === 'passed' &&
+          q.state.fingerprint === this.changes.fingerprint &&
+          (includePractice || !q.state.practice),
+      )
       .at(-1);
     if (!quiz) return { status: 'none' };
     if (quiz.state.fullFingerprint === this.changes.fullFingerprint || this.approvedLatestCommit(login)) {
@@ -276,8 +282,11 @@ class Reconciliation {
     return this.quizzesOf(login).find((q) => q.state.status === 'open' && q.state.fingerprint === this.changes.fingerprint);
   }
 
+  /** Open quizzes the gate waits for; practice quizzes don't hold it up. */
   private openQuizzes(): QuizComment[] {
-    return this.quizzes.filter((q) => q.state.status === 'open' && q.state.fingerprint === this.changes.fingerprint);
+    return this.quizzes.filter(
+      (q) => q.state.status === 'open' && !q.state.practice && q.state.fingerprint === this.changes.fingerprint,
+    );
   }
 
   /**
@@ -308,21 +317,31 @@ class Reconciliation {
 
   // --- Eligibility ---------------------------------------------------------------------------------------------
 
-  /** Who may take a quiz (and so be approved for): not an author of the change, and able to push. */
+  private isAuthor(login: string): boolean {
+    return loginsEqual(login, this.pr.user?.login) || this.committers.has(key(login));
+  }
+
+  private async canPush(login: string): Promise<boolean> {
+    const cached = this.writeAccess.get(key(login));
+    if (cached !== undefined) return cached;
+    let canPush: boolean;
+    try {
+      canPush = await this.gh.hasWriteAccess(login);
+    } catch (error) {
+      log.warning(`Could not read ${login}'s permission (${(error as Error).message}); falling back to author association.`);
+      canPush = this.reviews.some(
+        (r) => r.user && loginsEqual(r.user.login, login) && TRUSTED_ASSOCIATIONS.has(r.author_association ?? ''),
+      );
+    }
+    this.writeAccess.set(key(login), canPush);
+    return canPush;
+  }
+
+  /** Whose pass counts toward the gate: not an author of the change, and able to push. */
   private async isEligible(login: string): Promise<boolean> {
     const cached = this.eligibility.get(key(login));
     if (cached !== undefined) return cached;
-    let eligible = false;
-    if (!loginsEqual(login, this.pr.user?.login) && !this.committers.has(key(login))) {
-      try {
-        eligible = await this.gh.hasWriteAccess(login);
-      } catch (error) {
-        log.warning(`Could not read ${login}'s permission (${(error as Error).message}); falling back to author association.`);
-        eligible = this.reviews.some(
-          (r) => r.user && loginsEqual(r.user.login, login) && TRUSTED_ASSOCIATIONS.has(r.author_association ?? ''),
-        );
-      }
-    }
+    const eligible = !this.isAuthor(login) && (await this.canPush(login));
     this.eligibility.set(key(login), eligible);
     return eligible;
   }
@@ -451,7 +470,9 @@ class Reconciliation {
       return;
     }
     state.status = 'failed';
-    state.closingNotes = await this.handleFailure(state.reviewer, right, state.questions.length);
+    state.closingNotes = state.practice
+      ? [`Comment \`${this.config.command}\` for new questions.`]
+      : await this.handleFailure(state.reviewer, right, state.questions.length);
     await this.save(quiz);
     this.record('quiz-failed', `${who} answered ${right}/${state.questions.length} correctly.`);
   }
@@ -581,18 +602,19 @@ class Reconciliation {
     for (const login of candidates.values()) {
       const who = mention(login);
       const isCommander = !!commander && loginsEqual(login, commander);
-      if (this.passStatus(login).status !== 'none' || this.openQuiz(login)) {
-        if (isCommander) await this.react(this.trigger.commandCommentId, '+1');
-        continue;
-      }
-      if (!(await this.isEligible(login))) {
-        const why = `${who} cannot take the quiz (an author of the change, or no write access).`;
+      // Authors with write access get a practice quiz on request; their pass never counts toward the gate.
+      const practice = !(await this.isEligible(login));
+      if (practice && !(isCommander && (await this.canPush(login)))) {
         if (isCommander) {
-          this.record('quiz-skipped', why);
+          this.record('quiz-skipped', `${who} cannot take the quiz (no write access).`);
           await this.react(this.trigger.commandCommentId, 'confused');
         } else {
-          log.info(why);
+          log.info(`${who} is an author of the change or has no write access, so their approval does not start a quiz.`);
         }
+        continue;
+      }
+      if (this.passStatus(login, practice).status !== 'none' || this.openQuiz(login)) {
+        if (isCommander) await this.react(this.trigger.commandCommentId, '+1');
         continue;
       }
       if (this.config.maxAttempts > 0 && this.attemptHistory(login).failed >= this.config.maxAttempts) {
@@ -610,7 +632,7 @@ class Reconciliation {
         continue;
       }
       try {
-        await this.createQuiz(login);
+        await this.createQuiz(login, practice);
         if (isCommander) await this.react(this.trigger.commandCommentId, 'rocket');
       } catch (error) {
         const message = (error as Error).message;
@@ -661,7 +683,7 @@ class Reconciliation {
     return contents;
   }
 
-  private async createQuiz(login: string): Promise<void> {
+  private async createQuiz(login: string, practice: boolean): Promise<void> {
     const lastPass = this.quizzesOf(login)
       .filter((q) => q.state.status === 'passed')
       .at(-1);
@@ -711,6 +733,7 @@ class Reconciliation {
       fingerprint: this.changes.fingerprint,
       files: fileCount <= MAX_STORED_FILE_FINGERPRINTS ? this.changes.fileFingerprints : undefined,
       scope: incremental ? 'incremental' : 'full',
+      practice: practice || undefined,
       status: 'open',
       questions: generated.questions,
       model: this.deps.llm.model,

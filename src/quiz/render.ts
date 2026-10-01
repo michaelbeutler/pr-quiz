@@ -69,6 +69,7 @@ function shortSha(sha: string): string {
 function footer(state: QuizState, sealed: string): string[] {
   const parts = [
     `Attempt ${state.attempt}`,
+    state.practice ? 'practice' : undefined,
     `commit \`${shortSha(state.headSha)}\``,
     state.scope === 'incremental' ? 'follow-up on new commits' : undefined,
     `questions by \`${state.model}\``,
@@ -89,7 +90,12 @@ export function renderOpenQuiz(state: QuizState, sealed: string, selections?: bo
   const who = mention(state.reviewer);
   const lines: string[] = [QUIZ_MARKER, `## 🧠 PR Quiz for ${who}`, ''];
 
-  if (state.scope === 'incremental') {
+  if (state.practice) {
+    lines.push(
+      `${who}, you are an author of this change, so this is a practice quiz: passing it does not count toward the ` +
+        'gate, and a wrong answer changes nothing on the pull request. The questions were generated from the diff.',
+    );
+  } else if (state.scope === 'incremental') {
     lines.push(
       `${who}, new commits changed this pull request after you passed your last quiz. ` +
         'Before your approval counts for the new code, answer these questions about what changed.',
@@ -108,7 +114,9 @@ export function renderOpenQuiz(state: QuizState, sealed: string, selections?: bo
   lines.push(
     '',
     '- Tick **exactly one** answer per question, then tick **Submit answers** at the bottom.',
-    '- Every answer must be correct. If one is wrong, your approval is dismissed, your review is re-requested and you get new questions.',
+    state.practice
+      ? '- Every answer must be correct. If one is wrong, you see the right answers and can ask for new questions.'
+      : '- Every answer must be correct. If one is wrong, your approval is dismissed, your review is re-requested and you get new questions.',
     `- Only ${who} can answer this quiz.`,
     '',
     '---',
@@ -159,6 +167,7 @@ export function renderPassedQuiz(state: QuizState, sealed: string): string {
     '',
     `${who} answered ${n === 1 ? 'the question' : `all ${n} questions`} correctly on attempt ${state.attempt} ` +
       `(commit \`${shortSha(state.headSha)}\`).`,
+    ...(state.practice ? ['', 'This was a practice quiz by an author of the change; it does not count toward the gate.'] : []),
     '',
     '<details>',
     '<summary>Questions, answers and explanations</summary>',
