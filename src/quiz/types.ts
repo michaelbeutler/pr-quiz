@@ -28,6 +28,16 @@ export interface QuizResult {
   answers: number[];
   correct: boolean[];
   gradedAt: string;
+  /** When the reviewer answered, from GitHub's edit history. Reported, never used for grading. */
+  timing?: AnswerTiming;
+}
+
+export interface AnswerTiming {
+  /** The bot's first revision of the comment that showed these questions. */
+  shownAt: string;
+  /** The reviewer's first and last edits (checkbox ticks) of the comment. */
+  firstAnswerAt: string;
+  submittedAt: string;
 }
 
 /**
@@ -62,6 +72,8 @@ export interface QuizState {
   scope: 'full' | 'incremental';
   /** Requested by an author of the change: a pass doesn't count toward the gate and a failure dismisses nothing. */
   practice?: boolean;
+  /** The submit checkbox carries the reviewer's statement that they did not ask an AI for the answers. */
+  attested?: boolean;
   status: QuizStatus;
   questions: Question[];
   model: string;

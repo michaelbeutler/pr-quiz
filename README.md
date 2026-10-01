@@ -68,7 +68,7 @@ gets a 408 response every time. How many attempts does ky make, and why?
 
 …
 
-- [ ] **Submit answers**
+- [ ] **Submit answers**: I answered from my own reading of the code, not by asking an AI for the answers.
 ```
 
 A real question Claude generated for [sindresorhus/ky#867](https://github.com/sindresorhus/ky/pull/867);
@@ -182,7 +182,9 @@ first step of the hardening described under [Limitations](#limitations).
 
 ## For reviewers
 
-- Tick **exactly one** answer per question, then tick **Submit answers**.
+- Tick **exactly one** answer per question, then tick **Submit answers**. Ticking it also states that you
+  answered from your own reading of the code, not by asking an AI for the answers. Using AI to understand the
+  code is fine; the passed quiz and the bot's approval repeat your statement.
 - Only you can answer your quiz. If anyone else ticks a box in it (including the PR author), the quiz is
   invalidated and reposted with the same questions, without counting as an attempt.
 - A wrong answer dismisses your approval, re-requests your review, and posts new questions. The old quiz
@@ -243,6 +245,13 @@ Every run also writes a job summary.
 - **Only the reviewer's ticks count.** Ticking a checkbox edits the comment, and GitHub records who made
   each edit. At submission, the bot reads the comment's edit history and rejects the quiz if anyone other
   than the reviewer or the bot edited it.
+- **Answers come from the reviewer, not their AI.** The quiz can't stop a reviewer from pasting it into a chatbot
+  (see [Limitations](#limitations)), so it makes that a deliberate act instead: the submit checkbox carries the
+  reviewer's statement that they didn't ask an AI for the answers, and the quiz's raw markdown, which is what
+  `gh`, Copilot and GitHub MCP servers read, asks AI assistants to explain the code instead of picking answers.
+  The graded quiz and the job summary show how long the reviewer took, from GitHub's edit history. Timing is
+  only reported, never used for grading: a reviewer who read the code before approving answers as fast as one
+  who asked an AI.
 - **History you can't delete away.** Every new quiz carries the reviewer's failed-attempt count and the
   questions they have already seen, so deleting old quiz comments neither resets `max-attempts` nor brings
   back questions whose answers were shown.
@@ -285,6 +294,10 @@ use `model: claude-sonnet-5-5`, `effort: medium`, or `verify-questions: false`.
   select that App as the required source of the `pr-quiz` check in your ruleset, and protect
   `.github/workflows/**` with CODEOWNERS and a ruleset so workflow changes need review.
 - Deleting every quiz comment of a reviewer resets their attempt history; deleting only some doesn't.
+- **The quiz is open book.** Every question is answerable from the diff (the verification pass makes sure of
+  it), so a reviewer who pastes the quiz and the diff into an AI can pass. The attestation and the timing make
+  that visible and deliberate, not impossible. A pass shows that the reviewer engaged with the change and put
+  their name to it.
 - An LLM can still write a flawed question. The blind verification pass catches most of these, the graded
   quiz shows the explanation, and a failed attempt only costs a new set of questions.
 - GitHub lists at most 3000 files per PR; very large PRs are quizzed on what fits into `max-diff-chars`.

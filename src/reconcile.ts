@@ -15,8 +15,17 @@ import { generateQuiz } from './llm/generator.ts';
 import type { StateCodec } from './quiz/crypto.ts';
 import { grade } from './quiz/grade.ts';
 import { parseOpenQuiz } from './quiz/parse.ts';
-import { extractSealedState, isQuizBody, mention, renderPlaceholder, renderQuiz, REVIEW_MARKER } from './quiz/render.ts';
-import type { QuizComment, QuizState } from './quiz/types.ts';
+import {
+  answerDuration,
+  extractSealedState,
+  formatDuration,
+  isQuizBody,
+  mention,
+  renderPlaceholder,
+  renderQuiz,
+  REVIEW_MARKER,
+} from './quiz/render.ts';
+import type { AnswerTiming, QuizComment, QuizState } from './quiz/types.ts';
 import { log } from './util/action.ts';
 
 export type TriggerKind = 'approval' | 'review' | 'comment-edit' | 'command' | 'push' | 'manual';
@@ -71,6 +80,15 @@ function reviewRefusal(error: unknown): string {
     return `${message}. For GITHUB_TOKEN, enable "Allow GitHub Actions to create and approve pull requests" in the repository (and organization) settings.`;
   }
   return message;
+}
+
+/** ` in 1 min 12 s (first answer after 38 s)`, for logs and the job summary. */
+function describeTiming(state: QuizState): string {
+  const timing = state.result?.timing;
+  const total = answerDuration(state);
+  if (!timing || total === undefined) return '';
+  const first = Date.parse(timing.firstAnswerAt) - Date.parse(timing.shownAt);
+  return ` in ${formatDuration(total)} (first answer after ${formatDuration(first)})`;
 }
 
 function listLogins(logins: string[]): string {
@@ -460,13 +478,19 @@ class Reconciliation {
     }
 
     state.notice = undefined;
-    state.result = { answers: result.answers, correct: result.correct, gradedAt: this.now() };
+    state.result = {
+      answers: result.answers,
+      correct: result.correct,
+      gradedAt: this.now(),
+      timing: this.answerTiming(quiz, history),
+    };
     state.fullFingerprint = this.changes.fullFingerprint;
     const right = result.correct.filter(Boolean).length;
+    const took = describeTiming(state);
     if (result.passed) {
       state.status = 'passed';
       await this.save(quiz);
-      this.record('quiz-passed', `${who} answered ${right}/${state.questions.length} correctly.`);
+      this.record('quiz-passed', `${who} answered ${right}/${state.questions.length} correctly${took}.`);
       return;
     }
     state.status = 'failed';
@@ -474,7 +498,19 @@ class Reconciliation {
       ? [`Comment \`${this.config.command}\` for new questions.`]
       : await this.handleFailure(state.reviewer, right, state.questions.length);
     await this.save(quiz);
-    this.record('quiz-failed', `${who} answered ${right}/${state.questions.length} correctly.`);
+    this.record('quiz-failed', `${who} answered ${right}/${state.questions.length} correctly${took}.`);
+  }
+
+  /**
+   * When the questions appeared and when the reviewer ticked boxes, from GitHub's edit history. Only reported:
+   * someone who read the code before approving answers as fast as someone who asked an AI.
+   */
+  private answerTiming(quiz: QuizComment, history: CommentHistory): AnswerTiming | undefined {
+    const oldestFirst = [...history.edits].reverse();
+    const shown = oldestFirst.find((e) => e.editor && loginsEqual(e.editor, quiz.author) && isQuizBody(e.body));
+    const ticks = oldestFirst.filter((e) => e.editor && loginsEqual(e.editor, quiz.state.reviewer));
+    if (!shown || !ticks.length) return undefined;
+    return { shownAt: shown.editedAt, firstAnswerAt: ticks[0]!.editedAt, submittedAt: ticks.at(-1)!.editedAt };
   }
 
   /**
@@ -734,6 +770,7 @@ class Reconciliation {
       files: fileCount <= MAX_STORED_FILE_FINGERPRINTS ? this.changes.fileFingerprints : undefined,
       scope: incremental ? 'incremental' : 'full',
       practice: practice || undefined,
+      attested: true,
       status: 'open',
       questions: generated.questions,
       model: this.deps.llm.model,
@@ -845,7 +882,8 @@ class Reconciliation {
     const botReviews = this.reviews.filter((r) => r.user?.type === 'Bot' && (r.body ?? '').includes(REVIEW_MARKER));
     const latest = botReviews.filter((r) => r.state !== 'COMMENTED').at(-1);
     const open = this.openQuizzes();
-    const passers = this.passes().map((q) => q.state.reviewer);
+    const passes = this.passes();
+    const passers = passes.map((q) => q.state.reviewer);
     const sha = this.pr.head.sha;
 
     if (satisfied && passers.length === 0) {
@@ -855,7 +893,10 @@ class Reconciliation {
     }
     if (satisfied) {
       if (latest?.state === 'APPROVED') return;
-      const body = `${REVIEW_MARKER}\n✅ **PR Quiz passed** by ${listLogins(passers)}: every question about this change was answered correctly, so the approval is backed by understanding.`;
+      const attested = passes.every((q) => q.state.attested)
+        ? ` ${passers.length === 1 ? 'The reviewer' : 'Each reviewer'} confirmed answering from their own reading of the code, not by asking an AI.`
+        : '';
+      const body = `${REVIEW_MARKER}\n✅ **PR Quiz passed** by ${listLogins(passers)}: every question about this change was answered correctly, so the approval is backed by understanding.${attested}`;
       try {
         await this.gh.createReview(this.prNumber, 'APPROVE', body, sha);
         this.record('bot-approved', `Approved on behalf of ${listLogins(passers)}.`);
