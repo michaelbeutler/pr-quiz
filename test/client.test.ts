@@ -65,6 +65,54 @@ describe('RestGitHub', () => {
     expect((await gh.getCommentEdits('IC_1')).complete).toBe(false);
   });
 
+  it('reads the edit history of reviews like comments', async () => {
+    const { gh, calls } = client({
+      '/graphql': {
+        data: {
+          node: {
+            userContentEdits: {
+              pageInfo: { hasNextPage: false, endCursor: null },
+              nodes: [{ editedAt: '1', deletedAt: null, diff: 'review v1', editor: { login: 'alice', __typename: 'User' } }],
+            },
+          },
+        },
+      },
+    });
+    expect((await gh.getCommentEdits('PRR_1')).edits).toEqual([{ editor: 'alice', isBot: false, editedAt: '1', body: 'review v1' }]);
+    expect(calls[0]!.body.query).toContain('... on IssueComment');
+    expect(calls[0]!.body.query).toContain('... on PullRequestReview');
+  });
+
+  it('updates a review body', async () => {
+    const { gh, calls } = client({ '/pulls/7/reviews/9': { id: 9, body: 'restored' } });
+    expect((await gh.updateReview(7, 9, 'restored')).id).toBe(9);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({ method: 'PUT', url: 'https://api.github.com/repos/acme/shop/pulls/7/reviews/9', body: { body: 'restored' } });
+  });
+
+  it('lists reviews edited after submission', async () => {
+    const page = (hasNextPage: boolean, endCursor: string | null, nodes: unknown[]) => ({
+      data: { repository: { pullRequest: { reviews: { pageInfo: { hasNextPage, endCursor }, nodes } } } },
+    });
+    const pages = [
+      page(true, 'r1', [
+        { databaseId: 11, lastEditedAt: '2026-09-30T12:00:00Z' },
+        { databaseId: 12, lastEditedAt: null },
+      ]),
+      page(false, null, [{ databaseId: 13, lastEditedAt: '2026-09-30T12:01:00Z' }, null]),
+    ];
+    let n = 0;
+    const { gh, calls } = client({ '/graphql': () => pages[n++] });
+    expect(await gh.listEditedReviewIds(7)).toEqual(new Set([11, 13]));
+    expect(calls[0]!.body.variables).toEqual({ owner: 'acme', repo: 'shop', pr: 7, after: null });
+    expect(calls[1]!.body.variables).toEqual({ owner: 'acme', repo: 'shop', pr: 7, after: 'r1' });
+
+    const missing = client({ '/graphql': { data: { repository: { pullRequest: null } } } });
+    await expect(missing.gh.listEditedReviewIds(7)).rejects.toThrow(/no pull request #7/);
+    const endless = client({ '/graphql': page(true, 'more', []) });
+    await expect(endless.gh.listEditedReviewIds(7)).rejects.toThrow(/more than 5000 reviews/);
+  });
+
   it('judges write access by push permission, so custom roles work', async () => {
     const { gh } = client({
       '/collaborators/senior/permission': { permission: 'write', role_name: 'senior-dev', user: { permissions: { push: true } } },

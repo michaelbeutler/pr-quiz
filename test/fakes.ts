@@ -30,6 +30,7 @@ export function testConfig(overrides: Partial<Config> = {}): Config {
     verifyQuestions: true,
     requireAllApprovers: true,
     maxAttempts: 5,
+    allowChallenges: true,
     submitReviews: true,
     statusContext: 'pr-quiz',
     command: '/pr-quiz',
@@ -44,6 +45,13 @@ export function testConfig(overrides: Partial<Config> = {}): Config {
 }
 
 interface StoredComment extends IssueComment {
+  /** Newest first, like GitHub's userContentEdits. */
+  edits: ContentEdit[];
+}
+
+interface StoredReview extends Review {
+  node_id: string;
+  html_url: string;
   /** Newest first, like GitHub's userContentEdits. */
   edits: ContentEdit[];
 }
@@ -70,7 +78,7 @@ export const sampleFiles = (variant = 1): PullFile[] => [
 export class FakeGitHub implements GitHubApi {
   readonly botLogin: string;
   pr: PullRequest;
-  reviews: Review[] = [];
+  reviews: StoredReview[] = [];
   comments: StoredComment[] = [];
   files: PullFile[];
   statuses: Array<CommitStatus & { sha: string }> = [];
@@ -84,7 +92,13 @@ export class FakeGitHub implements GitHubApi {
   botMayApprove = true;
   /** Mirrors "Restrict who can dismiss pull request reviews" excluding the bot. */
   botMayDismiss = true;
+  /** False mirrors a token that may not submit (comment) reviews. */
+  botMayComment = true;
   failEditHistory = false;
+  /** Makes GraphQL's list of edited reviews fail. */
+  failReviewEdits = false;
+  /** Review ids whose edit history is too long to read in full: the bot's revisions fall outside the fetched pages. */
+  truncatedReviewHistory = new Set<number>();
   private nextId = 100;
   private tick = 0;
 
@@ -117,20 +131,48 @@ export class FakeGitHub implements GitHubApi {
     return comment;
   }
 
-  /** Replaces a comment body the way GitHub does, recording the revision (with its full body) in the history. */
-  private edit(comment: StoredComment, body: string, editor: string, isBot: boolean): void {
-    if (comment.edits.length === 0) {
+  private review(id: number): StoredReview {
+    const review = this.reviews.find((r) => r.id === id);
+    if (!review) throw new GitHubError(`review ${id} not found`, 404);
+    return review;
+  }
+
+  private storeReview(login: string, type: string, state: Review['state'], body: string, extra: Partial<Review> = {}): StoredReview {
+    const id = this.nextId++;
+    const review: StoredReview = {
+      id,
+      node_id: `PRR_${id}`,
+      user: { login, type },
+      state,
+      body,
+      commit_id: this.pr.head.sha,
+      submitted_at: this.time(),
+      html_url: `${this.pr.html_url}#pullrequestreview-${id}`,
+      edits: [],
+      ...extra,
+    };
+    this.reviews.push(review);
+    return review;
+  }
+
+  /**
+   * Replaces a comment or review body the way GitHub does, recording the revision (with its full body) in the
+   * history.
+   */
+  private edit(item: StoredComment | StoredReview, body: string, editor: string, isBot: boolean): void {
+    if (item.edits.length === 0) {
       // GitHub records the original version as the oldest entry on the first edit.
-      comment.edits.unshift({
-        editor: comment.user!.login.replace(/\[bot\]$/, ''),
-        isBot: comment.user!.type === 'Bot',
-        editedAt: comment.created_at,
-        body: comment.body,
+      item.edits.unshift({
+        editor: item.user!.login.replace(/\[bot\]$/, ''),
+        isBot: item.user!.type === 'Bot',
+        editedAt: 'created_at' in item ? item.created_at : (item.submitted_at ?? ''),
+        body: item.body,
       });
     }
-    comment.body = body;
-    comment.updated_at = this.time();
-    comment.edits.unshift({ editor: editor.replace(/\[bot\]$/, ''), isBot, editedAt: comment.updated_at, body });
+    item.body = body;
+    const editedAt = this.time();
+    if ('updated_at' in item) item.updated_at = editedAt;
+    item.edits.unshift({ editor: editor.replace(/\[bot\]$/, ''), isBot, editedAt, body });
   }
 
   // --- GitHubApi -------------------------------------------------------------------------------------------------
@@ -139,7 +181,7 @@ export class FakeGitHub implements GitHubApi {
     return structuredClone(this.pr);
   }
   async listReviews(): Promise<Review[]> {
-    return structuredClone(this.reviews);
+    return structuredClone(this.reviews.map(({ edits: _edits, ...r }) => r));
   }
   async listComments(): Promise<IssueComment[]> {
     return structuredClone(this.comments.map(({ edits: _edits, ...c }) => c));
@@ -179,12 +221,18 @@ export class FakeGitHub implements GitHubApi {
     if (event === 'APPROVE' && !this.botMayApprove) {
       throw new GitHubError('GitHub Actions is not permitted to approve pull requests.', 422);
     }
+    if (event === 'COMMENT' && !this.botMayComment) throw new GitHubError('Resource not accessible by integration', 403);
     const state = event === 'APPROVE' ? 'APPROVED' : event === 'REQUEST_CHANGES' ? 'CHANGES_REQUESTED' : 'COMMENTED';
-    const review: Review = { id: this.nextId++, user: this.botActor(), state, body, commit_id: commitId, submitted_at: this.time() };
-    this.reviews.push(review);
-    return structuredClone(review);
+    const review = this.storeReview(this.botLogin, 'Bot', state, body, { commit_id: commitId });
+    return structuredClone({ ...review, edits: undefined }) as Review;
   }
-  async dismissReview(_pr: number, reviewId: number): Promise<void> {
+  async updateReview(_pr: number, reviewId: number, body: string): Promise<Review> {
+    const review = this.review(reviewId);
+    if (!loginsEqual(review.user?.login, this.botLogin)) throw new GitHubError('Can only update your own review', 403);
+    this.edit(review, body, this.botLogin, true);
+    return structuredClone({ ...review, edits: undefined }) as Review;
+  }
+  async dismissReview(_pr: number, reviewId: number, _message?: string): Promise<void> {
     if (!this.botMayDismiss) throw new GitHubError('Must have admin rights to dismiss reviews.', 403);
     const review = this.reviews.find((r) => r.id === reviewId);
     if (!review) throw new GitHubError('review not found', 404);
@@ -202,8 +250,16 @@ export class FakeGitHub implements GitHubApi {
   }
   async getCommentEdits(nodeId: string): Promise<CommentHistory> {
     if (this.failEditHistory) throw new GitHubError('GraphQL unavailable', 502);
-    const comment = this.comments.find((c) => c.node_id === nodeId);
-    return { edits: structuredClone(comment?.edits ?? []), complete: true };
+    const review = this.reviews.find((r) => r.node_id === nodeId);
+    if (review && this.truncatedReviewHistory.has(review.id)) {
+      return { edits: structuredClone(review.edits.filter((e) => !e.isBot)), complete: false };
+    }
+    const item = this.comments.find((c) => c.node_id === nodeId) ?? review;
+    return { edits: structuredClone(item?.edits ?? []), complete: true };
+  }
+  async listEditedReviewIds(): Promise<Set<number>> {
+    if (this.failReviewEdits) throw new GitHubError('GraphQL unavailable', 502);
+    return new Set(this.reviews.filter((r) => r.edits.length > 0).map((r) => r.id));
   }
   async hasWriteAccess(login: string): Promise<boolean> {
     // Unknown users are collaborators with write access; custom roles based on write can push too.
@@ -218,32 +274,32 @@ export class FakeGitHub implements GitHubApi {
 
   // --- Simulated humans ---------------------------------------------------------------------------------------
 
-  approve(login: string, association = 'COLLABORATOR'): Review {
-    const review: Review = {
-      id: this.nextId++,
-      user: { login, type: 'User' },
-      state: 'APPROVED',
-      body: 'LGTM',
-      commit_id: this.pr.head.sha,
-      submitted_at: this.time(),
-      author_association: association,
-    };
-    this.reviews.push(review);
-    return review;
+  approve(login: string, association = 'COLLABORATOR'): StoredReview {
+    return this.storeReview(login, 'User', 'APPROVED', 'LGTM', { author_association: association });
   }
 
-  requestChanges(login: string): Review {
-    const review: Review = {
-      id: this.nextId++,
-      user: { login, type: 'User' },
-      state: 'CHANGES_REQUESTED',
-      body: 'Wait, this breaks refunds.',
-      commit_id: this.pr.head.sha,
-      submitted_at: this.time(),
-      author_association: 'COLLABORATOR',
-    };
-    this.reviews.push(review);
-    return review;
+  requestChanges(login: string): StoredReview {
+    return this.storeReview(login, 'User', 'CHANGES_REQUESTED', 'Wait, this breaks refunds.', { author_association: 'COLLABORATOR' });
+  }
+
+  /** A human submits a comment review. */
+  commentReview(login: string, body: string): StoredReview {
+    return this.storeReview(login, 'User', 'COMMENTED', body, { author_association: 'COLLABORATOR' });
+  }
+
+  /** Another workflow using GITHUB_TOKEN submits a review under the bot's identity. */
+  reviewAsBot(body: string, state: Review['state'] = 'COMMENTED'): StoredReview {
+    return this.storeReview(this.botLogin, 'Bot', state, body);
+  }
+
+  /** Someone with write access edits the body of any review (GitHub's REST API shows no trace of it). */
+  editReview(login: string, reviewId: number, body: string): void {
+    this.edit(this.review(reviewId), body, login, false);
+  }
+
+  /** Someone with write access deletes a revision's content from a review's edit history. */
+  pruneReviewRevision(reviewId: number, which: (edit: ContentEdit, index: number) => boolean): void {
+    for (const [index, edit] of this.review(reviewId).edits.entries()) if (which(edit, index)) edit.body = null;
   }
 
   /** A human posts a comment (e.g. the /pr-quiz command). */
@@ -312,6 +368,23 @@ export class FakeGitHub implements GitHubApi {
     return this.comment(commentId).body;
   }
 
+  /** Someone with write access deletes a comment. */
+  deleteComment(commentId: number): void {
+    const comment = this.comment(commentId);
+    this.comments = this.comments.filter((c) => c !== comment);
+  }
+
+  /** The bot's challenge records. */
+  challengeReviews(): StoredReview[] {
+    return this.reviews.filter(
+      (r) => r.user?.type === 'Bot' && r.state === 'COMMENTED' && (r.body ?? '').includes('<!-- pr-quiz:challenge -->'),
+    );
+  }
+
+  reactionsOn(commentId: number): string[] {
+    return this.reactions.filter((r) => r.commentId === commentId).map((r) => r.content);
+  }
+
   /** Changes what the pull request contains without a new head commit (e.g. retargeting the base branch). */
   retarget(files: PullFile[], base: string): void {
     this.files = files;
@@ -347,8 +420,9 @@ export class FakeGitHub implements GitHubApi {
     return this.statuses.filter((s) => s.sha === this.pr.head.sha).at(-1);
   }
 
+  /** The bot's latest decision; its comment reviews (challenge records) don't change it. */
   botReviewState(): string | undefined {
-    return this.reviews.filter((r) => r.user?.type === 'Bot').at(-1)?.state;
+    return this.reviews.filter((r) => r.user?.type === 'Bot' && r.state !== 'COMMENTED').at(-1)?.state;
   }
 
   reviewStateOf(login: string): string | undefined {

@@ -1,4 +1,5 @@
 import { randomBytes } from 'node:crypto';
+import type { Command } from './command.ts';
 import type { Config } from './config.ts';
 import { buildChangeSet, changedSince, contextCandidates, renderPullRequestContext, type ChangeSet } from './diff.ts';
 import {
@@ -14,18 +15,32 @@ import type { LlmBackend } from './llm/backend.ts';
 import { generateQuiz } from './llm/generator.ts';
 import type { StateCodec } from './quiz/crypto.ts';
 import { grade } from './quiz/grade.ts';
-import { parseOpenQuiz } from './quiz/parse.ts';
+import { normalizeBody, parseOpenQuiz } from './quiz/parse.ts';
 import {
   answerDuration,
+  extractChallengeState,
   extractSealedState,
   formatDuration,
   isQuizBody,
+  joinList,
+  listLogins,
   mention,
+  renderChallengeRecord,
   renderPlaceholder,
   renderQuiz,
   REVIEW_MARKER,
+  skippedTargetLines,
+  type ChallengeRecordInfo,
 } from './quiz/render.ts';
-import type { AnswerTiming, QuizComment, QuizState } from './quiz/types.ts';
+import {
+  quizKind,
+  type AnswerTiming,
+  type ChallengeRecord,
+  type ChallengeRef,
+  type QuizComment,
+  type QuizKind,
+  type QuizState,
+} from './quiz/types.ts';
 import { log } from './util/action.ts';
 
 export type TriggerKind = 'approval' | 'review' | 'comment-edit' | 'command' | 'push' | 'manual';
@@ -36,6 +51,8 @@ export interface Trigger {
   actor?: string;
   /** Comment id of a `/pr-quiz` command. */
   commandCommentId?: number;
+  /** Subcommand of a command comment; absent for a plain quiz request. */
+  command?: Command;
 }
 
 export type Gate = 'passed' | 'pending' | 'error' | 'skipped';
@@ -69,8 +86,17 @@ const MAX_ASKED_QUESTIONS = 30;
 const MAX_COMMENT_CHARS = 65_000;
 const MAX_CONTEXT_FILES = 15;
 const MAX_CONTEXT_FILE_CHARS = 60_000;
+/** Commit identities that are never a person: the web UI's committer and deleted accounts. */
+const NON_HUMAN_LOGINS = new Set(['web-flow', 'ghost']);
 
 const key = (login: string) => login.replace(/\[bot\]$/i, '').toLowerCase();
+
+/** Each login once, in the spelling it first appears in. */
+function uniqueLogins(logins: string[]): string[] {
+  const byKey = new Map<string, string>();
+  for (const login of logins) if (!byKey.has(key(login))) byKey.set(key(login), login);
+  return [...byKey.values()];
+}
 
 /** Why GitHub refused a review by the bot, in words that point at the fix. */
 function reviewRefusal(error: unknown): string {
@@ -91,16 +117,23 @@ function describeTiming(state: QuizState): string {
   return ` in ${formatDuration(total)} (first answer after ${formatDuration(first)})`;
 }
 
-function listLogins(logins: string[]): string {
-  const m = logins.map(mention);
-  return m.length <= 1 ? (m[0] ?? '') : `${m.slice(0, -1).join(', ')} and ${m[m.length - 1]}`;
-}
-
 type Integrity =
   | { ok: true }
   | { ok: false; restore?: QuizState; culprits: string[] };
 
 type PassStatus = 'valid' | 'needs-approval' | 'none';
+
+/** A challenge as its record review states it, or as a challenge quiz's copy does when the record is gone. */
+interface Challenge {
+  id: string;
+  by: string;
+  challengee: string;
+  at: string;
+  commandCommentId?: number;
+  /** The record review; unknown when the challenge is only known from a quiz's copy. */
+  reviewUrl?: string;
+  withdrawn?: boolean;
+}
 
 /**
  * One reconciliation of a pull request. Every trigger runs the full loop against GitHub's current state, so
@@ -118,12 +151,22 @@ class Reconciliation {
   private readonly eligibility = new Map<string, boolean>();
   private readonly writeAccess = new Map<string, boolean>();
   private committers = new Set<string>();
+  /** The commit authors and committers as GitHub spells them, which tells bots from people. */
+  private committerLogins: string[] = [];
   private previousStatus: CommitStatus | null = null;
   /** Generation was skipped because an earlier attempt failed and this trigger is not a retry. */
   private generationPaused = false;
   private pr!: PullRequest;
   private reviews: Review[] = [];
   private quizzes: QuizComment[] = [];
+  /** Every known challenge on the pull request, withdrawn ones included. */
+  private challenges: Challenge[] = [];
+  /** Command comments that already led to a withdraw record, so a re-run of an old event changes nothing. */
+  private readonly withdrawCommands: Array<{ by: string; commandCommentId: number }> = [];
+  /** A challenge record could not be verified while the pull request has challenges, so the gate can't pass. */
+  private challengesUnverified = false;
+  /** Open quizzes whose state this run checked against the bot's own revision, or posted itself. */
+  private readonly verifiedQuizIds = new Set<number>();
   private changes!: ChangeSet;
 
   constructor(deps: ReconcileDeps, prNumber: number, trigger: Trigger) {
@@ -142,6 +185,11 @@ class Reconciliation {
 
   private now(): string {
     return (this.deps.now?.() ?? new Date()).toISOString();
+  }
+
+  /** What a command comment asks for; undefined for other triggers. */
+  private get verb(): Command['verb'] | undefined {
+    return this.trigger.kind === 'command' ? (this.trigger.command?.verb ?? 'quiz') : undefined;
   }
 
   private record(type: string, detail: string): void {
@@ -167,18 +215,23 @@ class Reconciliation {
       this.gh.getStatus(this.pr.head.sha, this.config.statusContext).catch(() => null),
     ]);
     this.reviews = reviews;
+    this.committerLogins = committers;
     this.committers = new Set(committers.map(key));
     this.previousStatus = previousStatus;
     this.changes = buildChangeSet(files, this.config.ignorePaths);
     this.quizzes = await this.loadQuizzes(comments);
+    if (this.config.allowChallenges) await this.loadChallenges();
     if (this.changes.possiblyIncomplete) log.warning('GitHub lists at most 3000 files; the quiz only sees those.');
 
+    // Before the open quizzes, so a withdrawal or a replaced practice quiz closes them in the same run.
+    if (this.verb === 'challenge' || this.verb === 'withdraw') await this.handleChallengeCommand();
     for (const quiz of [...this.quizzes]) {
       if (quiz.state.status === 'open') await this.processOpenQuiz(quiz);
     }
+    await this.copyChallenges();
     if (this.changes.hasReadableChanges) {
       await this.ensureQuizzes();
-    } else if (this.trigger.kind === 'command') {
+    } else if (this.verb === 'quiz') {
       await this.react(this.trigger.commandCommentId, 'confused');
     }
     await this.linkFollowUps();
@@ -247,6 +300,112 @@ class Reconciliation {
     return quiz;
   }
 
+  /**
+   * Reads the challenges from the bot's comment reviews. GitHub offers no way to delete a submitted review or to
+   * dismiss a comment review, but people with write access can edit its body, so an edited record only counts in
+   * the bot's own latest revision, which is put back. Each challenge quiz carries a copy of its challenges, which
+   * keeps a challenge whose record is gone. What can't be verified fails closed on pull requests with challenges.
+   */
+  private async loadChallenges(): Promise<void> {
+    const problems: string[] = [];
+    const fail = (error: Error): undefined => {
+      problems.push(error.message);
+      return undefined;
+    };
+    const records: Array<{ record: ChallengeRecord; review: Review }> = [];
+    const candidates = this.reviews.filter((r) => r.user?.type === 'Bot' && r.state === 'COMMENTED');
+    // The identity that posts this gate's quizzes and reviews; its edited comment reviews may be challenge records.
+    const gateBots = [
+      ...this.quizzes.map((q) => q.author),
+      ...this.reviews.filter((r) => r.user?.type === 'Bot' && (r.body ?? '').includes(REVIEW_MARKER)).map((r) => r.user!.login),
+    ];
+    // An edited review that may be a record but can't be checked may be the only trace of a challenge.
+    let unverifiedRecord = false;
+    const edited = candidates.length ? await this.gh.listEditedReviewIds(this.prNumber).catch(fail) : new Set<number>();
+    for (const review of candidates) {
+      const current = this.openRecord(review.body);
+      if (!edited?.has(review.id)) {
+        // Never edited, so exactly what the bot posted (or unknown because the list failed: then the run is unverified).
+        if (current) records.push({ record: current, review });
+        continue;
+      }
+      const history = review.node_id
+        ? await this.gh.getCommentEdits(review.node_id).catch(fail)
+        : fail(new Error(`review ${review.id} has no node id`));
+      if (!history) {
+        if (current || gateBots.some((login) => loginsEqual(login, review.user?.login))) unverifiedRecord = true;
+        continue;
+      }
+      const ours = history.edits.flatMap((e) => {
+        const record = e.body && loginsEqual(e.editor, review.user?.login) ? this.openRecord(e.body) : null;
+        return record ? [{ body: e.body!, record }] : [];
+      });
+      const latest = ours[0];
+      if (!latest) {
+        // Not a record, or the bot's revisions were deleted from the history: the current body proves nothing.
+        if (current && !history.complete) {
+          unverifiedRecord = true;
+          fail(new Error(`the edit history of review ${review.id} is too long to check`));
+        }
+        continue;
+      }
+      if (normalizeBody(latest.body) !== normalizeBody(review.body ?? '')) await this.restoreRecord(review, latest.body, history);
+      records.push({ record: latest.record, review });
+    }
+
+    const known = new Map<string, Challenge>();
+    const withdrawn = new Set<string>();
+    for (const { record, review } of records) {
+      if (record.kind === 'withdraw') {
+        for (const id of record.ids) withdrawn.add(id);
+        if (record.commandCommentId !== undefined) this.withdrawCommands.push({ by: record.by, commandCommentId: record.commandCommentId });
+      } else if (!known.has(record.id)) {
+        const { id, by, challengee, at, commandCommentId } = record;
+        known.set(id, { id, by, challengee, at, commandCommentId, reviewUrl: review.html_url });
+      }
+    }
+    for (const quiz of this.quizzes) {
+      for (const ref of [...(quiz.state.challenge?.refs ?? []), ...(quiz.state.challenge?.later ?? [])]) {
+        if (!known.has(ref.id)) known.set(ref.id, { ...ref, challengee: quiz.state.reviewer });
+      }
+    }
+    this.challenges = [...known.values()].map((c) => ({ ...c, withdrawn: withdrawn.has(c.id) }));
+
+    if (!problems.length) return;
+    const message = `Could not verify the challenge records: ${problems.join('; ')}`;
+    log.warning(message);
+    const hasChallenges =
+      unverifiedRecord ||
+      this.challenges.length > 0 ||
+      this.quizzes.some((q) => q.state.challenge) ||
+      this.verb === 'challenge' ||
+      this.verb === 'withdraw';
+    // A GraphQL hiccup never touches pull requests without challenges or a record that may hold one; the next event checks again.
+    if (hasChallenges) {
+      this.verificationErrors.push(message);
+      this.challengesUnverified = true;
+    }
+  }
+
+  private openRecord(body: string | null | undefined): ChallengeRecord | null {
+    const sealed = extractChallengeState(body);
+    return sealed ? this.deps.codec.openChallenge(this.prNumber, sealed) : null;
+  }
+
+  /** Puts the bot's own text back into a challenge record someone else edited. */
+  private async restoreRecord(review: Review, body: string, history: CommentHistory): Promise<void> {
+    const editors = history.edits.filter((e) => !loginsEqual(e.editor, review.user?.login)).map((e) => e.editor ?? 'ghost');
+    const who = [...new Set(editors)].map((l) => `\`${l}\``).join(', ') || 'someone';
+    try {
+      await this.gh.updateReview(this.prNumber, review.id, body);
+      review.body = body;
+      this.record('challenge-restored', `Undid edits by ${who} to the challenge record ${review.html_url ?? review.id}.`);
+    } catch (error) {
+      // The verified record counts anyway.
+      log.warning(`Could not restore challenge record ${review.id}: ${(error as Error).message}`);
+    }
+  }
+
   private quizzesOf(login: string): QuizComment[] {
     return this.quizzes.filter((q) => loginsEqual(q.state.reviewer, login));
   }
@@ -265,7 +424,8 @@ class Reconciliation {
 
   /**
    * A pass is valid for the code the quiz covered. If only ignored or binary files changed since (which a quiz
-   * can't cover), the reviewer must approve the latest commit again for the pass to keep counting.
+   * can't cover), the reviewer must approve the latest commit again for the pass to keep counting. A challenge
+   * quiz is never a reviewer's pass.
    */
   private passStatus(login: string, includePractice = false): { status: PassStatus; quiz?: QuizComment } {
     const quiz = this.quizzesOf(login)
@@ -273,6 +433,7 @@ class Reconciliation {
         (q) =>
           q.state.status === 'passed' &&
           q.state.fingerprint === this.changes.fingerprint &&
+          !q.state.challenge &&
           (includePractice || !q.state.practice),
       )
       .at(-1);
@@ -296,8 +457,13 @@ class Reconciliation {
     return [...byReviewer.values()];
   }
 
-  private openQuiz(login: string): QuizComment | undefined {
-    return this.quizzesOf(login).find((q) => q.state.status === 'open' && q.state.fingerprint === this.changes.fingerprint);
+  private openQuiz(login: string, kind: 'challenge' | 'other' = 'other'): QuizComment | undefined {
+    return this.quizzesOf(login).find(
+      (q) =>
+        q.state.status === 'open' &&
+        q.state.fingerprint === this.changes.fingerprint &&
+        !!q.state.challenge === (kind === 'challenge'),
+    );
   }
 
   /** Open quizzes the gate waits for; practice quizzes don't hold it up. */
@@ -310,15 +476,21 @@ class Reconciliation {
   /**
    * Failed attempts and questions seen so far. Every quiz carries this history forward in its sealed state, so
    * deleting old quiz comments neither resets the attempt limit nor brings back questions whose answers were shown.
+   * Challenge quizzes count apart: only those of the newest challenge, so every new challenge brings new attempts.
+   * Questions seen in any quiz are never asked again.
    */
-  private attemptHistory(login: string): { failed: number; asked: string[] } {
+  private attemptHistory(login: string, kind: 'challenge' | 'other' = 'other'): { failed: number; asked: string[] } {
     const mine = this.quizzesOf(login);
-    let failed = mine.filter((q) => q.state.status === 'failed').length;
-    const asked: string[] = [];
-    for (const quiz of mine) {
+    const newest = kind === 'challenge' ? this.newestChallenge(login) : undefined;
+    const counted = mine.filter((q) =>
+      kind === 'challenge' ? !!newest && !!q.state.challenge?.refs.some((r) => r.id === newest.id) : !q.state.challenge,
+    );
+    let failed = counted.filter((q) => q.state.status === 'failed').length;
+    for (const quiz of counted) {
       failed = Math.max(failed, (quiz.state.failedBefore ?? 0) + (quiz.state.status === 'failed' ? 1 : 0));
-      asked.push(...(quiz.state.asked ?? []), ...quiz.state.questions.map((q) => q.text.slice(0, 200)));
     }
+    const asked: string[] = [];
+    for (const quiz of mine) asked.push(...(quiz.state.asked ?? []), ...quiz.state.questions.map((q) => q.text.slice(0, 200)));
     return { failed, asked: [...new Set(asked)].slice(-MAX_ASKED_QUESTIONS) };
   }
 
@@ -331,6 +503,268 @@ class Reconciliation {
       latest.set(key(review.user.login), review);
     }
     return [...latest.values()].filter((r) => r.state === 'APPROVED').map((r) => r.user!.login);
+  }
+
+  // --- Challenges ----------------------------------------------------------------------------------------------
+
+  /** Known challenges that no withdraw record ends; none while challenges are turned off. */
+  private activeChallenges(login?: string): Challenge[] {
+    if (!this.config.allowChallenges) return [];
+    return this.challenges.filter((c) => !c.withdrawn && (login === undefined || loginsEqual(c.challengee, login)));
+  }
+
+  private challengees(): string[] {
+    return uniqueLogins(this.activeChallenges().map((c) => c.challengee));
+  }
+
+  private challengersOf(login: string): string[] {
+    return uniqueLogins(this.activeChallenges(login).map((c) => c.by));
+  }
+
+  /** The author owes a challenge quiz. Challenges rest while the pull request has nothing a quiz could cover. */
+  private isChallenged(login: string): boolean {
+    return this.changes.hasReadableChanges && this.activeChallenges(login).length > 0;
+  }
+
+  /** One passed challenge quiz on the current code meets every challenge to the author; a practice pass never does. */
+  private challengeMet(login: string): boolean {
+    return this.quizzesOf(login).some(
+      (q) => !!q.state.challenge && q.state.status === 'passed' && q.state.fingerprint === this.changes.fingerprint,
+    );
+  }
+
+  /** Challenged authors the gate still waits for. */
+  private unmetChallengees(): string[] {
+    if (!this.changes.hasReadableChanges) return [];
+    return this.challengees().filter((login) => !this.challengeMet(login));
+  }
+
+  /** The challenge with the latest command; its quizzes count toward the author's attempts. */
+  private newestChallenge(login: string): Challenge | undefined {
+    let newest: Challenge | undefined;
+    for (const c of this.activeChallenges(login)) {
+      if (!newest || (c.commandCommentId ?? 0) > (newest.commandCommentId ?? 0)) newest = c;
+    }
+    return newest;
+  }
+
+  private lockedOut(login: string): boolean {
+    return this.config.maxAttempts > 0 && this.attemptHistory(login, 'challenge').failed >= this.config.maxAttempts;
+  }
+
+  /**
+   * The login as the pull request knows it, if it is an author of the change, and whether it is a person. The exact
+   * spelling decides, so `@renovate` can't stand for `renovate[bot]`.
+   */
+  private authorIdentity(login: string): { login: string; human: boolean } | undefined {
+    const opener = this.pr.user;
+    if (opener && loginsEqual(login, opener.login)) {
+      return { login: opener.login, human: opener.type !== 'Bot' && !/\[bot\]$/i.test(opener.login) };
+    }
+    const committer =
+      this.committerLogins.find((c) => c.toLowerCase() === login.toLowerCase()) ??
+      this.committerLogins.find((c) => loginsEqual(c, login));
+    if (!committer) return undefined;
+    return { login: committer, human: !/\[bot\]$/i.test(committer) && !NON_HUMAN_LOGINS.has(committer.toLowerCase()) };
+  }
+
+  /**
+   * Whom a challenge names: the mentioned authors, or by default the opener (on a pull request a bot opened, every
+   * human committer). Only human authors of the change who can tick the quiz's checkboxes can be challenged.
+   */
+  private async resolveTargets(targets: string[]): Promise<{ logins: string[]; notAuthors: string[]; noWriteAccess: string[] }> {
+    const authors: string[] = [];
+    const notAuthors: string[] = [];
+    if (targets.length) {
+      for (const target of targets) {
+        // A `[bot]` spelling never names a person, even when the same name without it does.
+        const author = /\[bot\]$/i.test(target) ? undefined : this.authorIdentity(target);
+        if (author?.human) authors.push(author.login);
+        else notAuthors.push(target);
+      }
+    } else {
+      const opener = this.pr.user ? this.authorIdentity(this.pr.user.login) : undefined;
+      if (opener?.human) authors.push(opener.login);
+      else authors.push(...this.committerLogins.filter((login) => this.authorIdentity(login)?.human));
+    }
+    const logins: string[] = [];
+    const noWriteAccess: string[] = [];
+    for (const login of uniqueLogins(authors)) {
+      if (await this.canPush(login)) logins.push(login);
+      else noWriteAccess.push(login);
+    }
+    return { logins, notAuthors, noWriteAccess };
+  }
+
+  private async handleChallengeCommand(): Promise<void> {
+    const { actor, command } = this.trigger;
+    if (!actor || !command || command.verb === 'quiz') return;
+    if (command.verb === 'challenge') await this.challenge(actor, command.targets);
+    else await this.withdraw(actor, command.targets);
+  }
+
+  /** `/pr-quiz challenge [@author …]`: records a challenge for each author it names. */
+  private async challenge(actor: string, targets: string[]): Promise<void> {
+    const commandId = this.trigger.commandCommentId;
+    const by = mention(actor);
+    const reject = async (reason: string): Promise<void> => {
+      this.record('challenge-rejected', `${by} can't challenge: ${reason}`);
+      await this.react(commandId, 'confused');
+    };
+    if (!this.config.allowChallenges) return reject('challenges are turned off (allow-challenges: false).');
+    if (commandId !== undefined && this.challenges.some((c) => c.commandCommentId === commandId)) {
+      await this.react(commandId, '+1'); // a re-run of the same event
+      return;
+    }
+    // A re-run of an old challenge command never undoes a withdrawal the actor made after it.
+    if (commandId !== undefined && this.withdrawCommands.some((w) => loginsEqual(w.by, actor) && w.commandCommentId > commandId)) {
+      await this.react(commandId, '+1');
+      return;
+    }
+    if (!this.changes.hasReadableChanges) return reject('nothing in this pull request can be quizzed.');
+    // The same rule that makes a pass count: only someone whose own pass could open the gate can ask for more.
+    if (!(await this.isEligible(actor))) return reject("authors of the change and people without write access can't challenge.");
+    const { logins, notAuthors, noWriteAccess } = await this.resolveTargets(targets);
+    if (!logins.length) {
+      return reject(skippedTargetLines(notAuthors, noWriteAccess).join(' ') || 'the pull request has no human author to challenge.');
+    }
+
+    let posted = 0;
+    let failed = false;
+    for (const login of logins) {
+      // While the records can't be verified, a challenge that looks active may have been withdrawn: record it again.
+      const already =
+        !this.challengesUnverified &&
+        this.activeChallenges(login).some((c) => loginsEqual(c.by, actor)) &&
+        (this.challengeMet(login) || !this.lockedOut(login));
+      if (already) continue;
+      const met = this.challengeMet(login);
+      const record: ChallengeRecord = {
+        v: 1,
+        kind: 'challenge',
+        id: randomBytes(8).toString('hex'),
+        by: actor,
+        challengee: login,
+        at: this.now(),
+        commandCommentId: commandId,
+      };
+      const info: ChallengeRecordInfo = {
+        command: this.config.command,
+        met,
+        openQuizUrl: this.openQuiz(login, 'challenge')?.url,
+        renewedAttempts: !met && this.lockedOut(login) ? this.config.maxAttempts : undefined,
+        // Mentions that were not challenged are named once, in the first record.
+        ...(posted ? {} : { notAuthors, noWriteAccess }),
+      };
+      let review: Review;
+      try {
+        review = await this.postChallengeRecord(record, info);
+      } catch (error) {
+        // No fallback to a store people could delete: without its record there is no challenge.
+        const message = (error as Error).message;
+        log.warning(`Could not post the challenge record: ${message}`);
+        this.record('challenge-rejected', `Could not post the challenge record: ${message}`);
+        failed = true;
+        break;
+      }
+      this.challenges.push({ id: record.id, by: actor, challengee: login, at: record.at, commandCommentId: commandId, reviewUrl: review.html_url });
+      this.record('challenge-recorded', `${by} challenged ${mention(login)}: ${review.html_url ?? `review ${review.id}`}`);
+      posted++;
+    }
+    if (posted) await this.react(commandId, 'rocket');
+    if (failed) await this.react(commandId, 'confused');
+    else if (!posted) await this.react(commandId, '+1'); // the actor had challenged them all already
+  }
+
+  /** `/pr-quiz withdraw [@author …]`: only the reviewer who challenged can end their challenges. */
+  private async withdraw(actor: string, targets: string[]): Promise<void> {
+    const commandId = this.trigger.commandCommentId;
+    const by = mention(actor);
+    const reject = async (reason: string): Promise<void> => {
+      this.record('withdraw-rejected', `${by} can't withdraw: ${reason}`);
+      await this.react(commandId, 'confused');
+    };
+    if (!this.config.allowChallenges) return reject('challenges are turned off (allow-challenges: false).');
+    if (commandId !== undefined && this.withdrawCommands.some((w) => w.commandCommentId === commandId)) {
+      await this.react(commandId, '+1'); // a re-run of the same event
+      return;
+    }
+    // A re-run of an old withdraw command never ends a challenge made after it.
+    const mine = this.activeChallenges().filter(
+      (c) =>
+        loginsEqual(c.by, actor) &&
+        (!targets.length || targets.some((t) => loginsEqual(t, c.challengee))) &&
+        (c.commandCommentId ?? 0) < (commandId ?? 0),
+    );
+    if (!mine.length || !(await this.canPush(actor))) return reject('only the reviewer who challenged can withdraw.');
+
+    const challengees = uniqueLogins(mine.map((c) => c.challengee));
+    const remaining = this.activeChallenges().filter(
+      (c) => !mine.includes(c) && challengees.some((login) => loginsEqual(login, c.challengee)),
+    );
+    const record: ChallengeRecord = {
+      v: 1,
+      kind: 'withdraw',
+      ids: mine.map((c) => c.id),
+      by: actor,
+      at: this.now(),
+      commandCommentId: commandId,
+    };
+    let review: Review;
+    try {
+      review = await this.postChallengeRecord(record, {
+        command: this.config.command,
+        challengees,
+        remaining: uniqueLogins(remaining.map((c) => c.by)),
+      });
+    } catch (error) {
+      const message = (error as Error).message;
+      log.warning(`Could not post the withdraw record: ${message}`);
+      return reject(`could not post the withdraw record (${message}).`);
+    }
+    for (const c of mine) c.withdrawn = true;
+    if (commandId !== undefined) this.withdrawCommands.push({ by: actor, commandCommentId: commandId });
+    this.record('challenge-withdrawn', `${by} withdrew their challenge for ${listLogins(challengees)}: ${review.html_url ?? `review ${review.id}`}`);
+    await this.react(commandId, '+1');
+  }
+
+  /** A comment review of the bot, sealed like a quiz's answer key; it is never edited except to undo others' edits. */
+  private postChallengeRecord(record: ChallengeRecord, info: ChallengeRecordInfo): Promise<Review> {
+    const body = renderChallengeRecord(record, this.deps.codec.sealChallenge(this.prNumber, record), info);
+    return this.gh.createReview(this.prNumber, 'COMMENT', body, this.pr.head.sha);
+  }
+
+  /**
+   * A challenge made while the author's challenge quiz is open, or after they passed one on the current code, gets
+   * no quiz of its own, so it is copied into that quiz: then it outlives its record like every other challenge.
+   * Only quizzes checked against the bot's own revision in this run are rewritten, so the bot never re-signs state
+   * someone pasted in. A challenge whose quiz could not be generated yet still depends on its record alone.
+   */
+  private async copyChallenges(): Promise<void> {
+    if (this.challengesUnverified) return;
+    for (const login of this.challengees()) {
+      const open = this.openQuiz(login, 'challenge');
+      const met = this.quizzesOf(login)
+        .filter((q) => q.state.challenge && q.state.status === 'passed' && q.state.fingerprint === this.changes.fingerprint)
+        .at(-1);
+      for (const quiz of [open && this.verifiedQuizIds.has(open.commentId) ? open : undefined, met]) {
+        const carried = quiz?.state.challenge;
+        if (!quiz || !carried) continue;
+        const missing = this.activeChallenges(login)
+          .filter((c) => ![...carried.refs, ...(carried.later ?? [])].some((r) => r.id === c.id))
+          .map(({ id, by, at, commandCommentId }) => ({ id, by, at, commandCommentId }));
+        if (!missing.length) continue;
+        // Keep the author's ticks: the copy only changes the sealed state.
+        const parsed = quiz.state.status === 'open' ? parseOpenQuiz(quiz.body, quiz.state, extractSealedState(quiz.body)!) : undefined;
+        carried.later = [...(carried.later ?? []), ...missing];
+        try {
+          await this.save(quiz, parsed?.readable ? parsed.selections : undefined);
+          log.info(`Copied ${missing.length} challenge(s) for ${login} into quiz ${quiz.commentId}.`);
+        } catch (error) {
+          log.warning(`Could not copy the challenges for ${login} into quiz ${quiz.commentId}: ${(error as Error).message}`);
+        }
+      }
+    }
   }
 
   // --- Eligibility ---------------------------------------------------------------------------------------------
@@ -387,7 +821,7 @@ class Reconciliation {
 
   /** Posts a placeholder first so the state can be sealed together with the id of the comment it lives in. */
   private async post(state: QuizState): Promise<QuizComment> {
-    const placeholder = await this.gh.createComment(this.prNumber, renderPlaceholder(state.reviewer));
+    const placeholder = await this.gh.createComment(this.prNumber, renderPlaceholder(state.reviewer, !!state.challenge));
     state.commentId = placeholder.id;
     const comment = await this.gh.updateComment(placeholder.id, this.render(state));
     const quiz: QuizComment = {
@@ -400,6 +834,7 @@ class Reconciliation {
       state,
     };
     this.quizzes.push(quiz);
+    this.verifiedQuizIds.add(quiz.commentId);
     return quiz;
   }
 
@@ -408,8 +843,13 @@ class Reconciliation {
     for (const quiz of this.quizzes) {
       const { state } = quiz;
       if ((state.status !== 'failed' && state.status !== 'outdated') || state.followUpUrl) continue;
+      // A challenge quiz and a reviewer quiz of the same login follow up on their own kind; practice leads to either.
       const next = this.quizzes.find(
-        (q) => q.commentId > quiz.commentId && q.state.status === 'open' && loginsEqual(q.state.reviewer, state.reviewer),
+        (q) =>
+          q.commentId > quiz.commentId &&
+          q.state.status === 'open' &&
+          loginsEqual(q.state.reviewer, state.reviewer) &&
+          (state.practice || !!q.state.challenge === !!state.challenge),
       );
       if (!next) continue;
       state.followUpUrl = next.url;
@@ -433,6 +873,7 @@ class Reconciliation {
       await this.handleTampering(quiz, integrity);
       return;
     }
+    this.verifiedQuizIds.add(quiz.commentId);
 
     const { state } = quiz;
     const who = mention(state.reviewer);
@@ -442,8 +883,25 @@ class Reconciliation {
       this.record('quiz-outdated', `Quiz for ${who} no longer matches the code after new commits.`);
       return;
     }
+    // Records that can't be verified may be missing a challenge or a withdrawal, so they close nothing.
+    if (!this.challengesUnverified && state.practice && this.isChallenged(state.reviewer)) {
+      state.status = 'outdated';
+      state.closedReason = `${listLogins(this.challengersOf(state.reviewer))} challenged ${who}, so this practice quiz was replaced by a challenge quiz.`;
+      await this.save(quiz);
+      this.record('quiz-replaced', `Replaced ${who}'s practice quiz with a challenge quiz.`);
+      return;
+    }
+    if (!this.challengesUnverified && state.challenge && !this.isChallenged(state.reviewer)) {
+      const reason = this.config.allowChallenges ? 'The challenge was withdrawn' : 'Challenges are turned off for this repository';
+      state.status = 'outdated';
+      state.closedReason = `${reason}, so this quiz no longer needs an answer.`;
+      await this.save(quiz);
+      this.record('quiz-closed', `Closed ${who}'s challenge quiz: ${reason.toLowerCase()}.`);
+      return;
+    }
+    // A challenge quiz and a reviewer quiz can be open side by side for an author who can review again.
     const duplicate = this.quizzesOf(state.reviewer).find(
-      (q) => q !== quiz && q.state.status === 'open' && q.commentId > quiz.commentId,
+      (q) => q !== quiz && q.state.status === 'open' && q.commentId > quiz.commentId && !!q.state.challenge === !!state.challenge,
     );
     if (duplicate) {
       state.status = 'outdated';
@@ -494,9 +952,11 @@ class Reconciliation {
       return;
     }
     state.status = 'failed';
-    state.closingNotes = state.practice
-      ? [`Comment \`${this.config.command}\` for new questions.`]
-      : await this.handleFailure(state.reviewer, right, state.questions.length);
+    state.closingNotes = state.challenge
+      ? [`Nothing on the pull request was dismissed. The challenge stays open until ${who} passes a challenge quiz.`]
+      : state.practice
+        ? [`Comment \`${this.config.command}\` for new questions.`]
+        : await this.handleFailure(state.reviewer, right, state.questions.length);
     await this.save(quiz);
     this.record('quiz-failed', `${who} answered ${right}/${state.questions.length} correctly${took}.`);
   }
@@ -625,19 +1085,32 @@ class Reconciliation {
   // --- Creating quizzes ----------------------------------------------------------------------------------------
 
   private async ensureQuizzes(): Promise<void> {
-    const candidates = new Map<string, string>(); // key -> login
-    for (const login of this.activeApprovers()) candidates.set(key(login), login);
+    const reviewers = new Map<string, string>(); // key -> login
+    for (const login of this.activeApprovers()) reviewers.set(key(login), login);
     for (const quiz of this.quizzes) {
-      const latest = this.quizzesOf(quiz.state.reviewer).at(-1);
+      // A challenge quiz is retaken while its challenge is unmet (below), not because it failed.
+      if (quiz.state.challenge) continue;
+      const latest = this.quizzesOf(quiz.state.reviewer)
+        .filter((q) => !q.state.challenge)
+        .at(-1);
       // A failed attempt always earns a retake, even if generating it failed in an earlier run.
-      if (latest === quiz && quiz.state.status === 'failed') candidates.set(key(quiz.state.reviewer), quiz.state.reviewer);
+      if (latest === quiz && quiz.state.status === 'failed') reviewers.set(key(quiz.state.reviewer), quiz.state.reviewer);
     }
-    const commander = this.trigger.kind === 'command' ? this.trigger.actor : undefined;
+    const candidates = new Map(reviewers);
+    // Only a plain `/pr-quiz` asks for a quiz for the commenter.
+    const commander = this.verb === 'quiz' ? this.trigger.actor : undefined;
     if (commander) candidates.set(key(commander), commander);
+    for (const login of this.unmetChallengees()) candidates.set(key(login), login);
 
     for (const login of candidates.values()) {
       const who = mention(login);
-      const isCommander = !!commander && loginsEqual(login, commander);
+      let isCommander = !!commander && loginsEqual(login, commander);
+      if (this.isChallenged(login)) {
+        await this.ensureChallengeQuiz(login, isCommander);
+        // A challenged author whose commits are gone can review now: their approval needs a reviewer quiz of its own.
+        if (!reviewers.has(key(login)) || !(await this.isEligible(login))) continue;
+        isCommander = false; // the challenge quiz answered the command
+      }
       // Authors with write access get a practice quiz on request; their pass never counts toward the gate.
       const practice = !(await this.isEligible(login));
       if (practice && !(isCommander && (await this.canPush(login)))) {
@@ -658,17 +1131,9 @@ class Reconciliation {
         if (isCommander) await this.react(this.trigger.commandCommentId, 'confused');
         continue;
       }
-      if (
-        this.previousStatus?.state === 'error' &&
-        this.previousStatus.description.startsWith(GENERATION_ERROR_PREFIX) &&
-        !RETRY_TRIGGERS.has(this.trigger.kind)
-      ) {
-        this.generationPaused = true;
-        log.info(`Not retrying quiz generation for ${login} on a ${this.trigger.kind} event after an earlier error.`);
-        continue;
-      }
+      if (this.generationPausedFor(login)) continue;
       try {
-        await this.createQuiz(login, practice);
+        await this.createQuiz(login, practice ? 'practice' : 'review');
         if (isCommander) await this.react(this.trigger.commandCommentId, 'rocket');
       } catch (error) {
         const message = (error as Error).message;
@@ -676,6 +1141,42 @@ class Reconciliation {
         log.error(`Could not create a quiz for ${login}: ${message}`);
       }
     }
+  }
+
+  /** A challenged author gets a challenge quiz (never a practice quiz) until one passes on the current code. */
+  private async ensureChallengeQuiz(login: string, isCommander: boolean): Promise<void> {
+    if (this.challengeMet(login) || this.openQuiz(login, 'challenge')) {
+      if (isCommander) await this.react(this.trigger.commandCommentId, '+1');
+      return;
+    }
+    if (this.lockedOut(login)) {
+      await this.lockOutChallenge(login);
+      if (isCommander) await this.react(this.trigger.commandCommentId, 'confused');
+      return;
+    }
+    if (this.generationPausedFor(login)) return;
+    try {
+      await this.createQuiz(login, 'challenge');
+      if (isCommander) await this.react(this.trigger.commandCommentId, 'rocket');
+    } catch (error) {
+      const message = (error as Error).message;
+      this.errors.push(message);
+      log.error(`Could not create a challenge quiz for ${login}: ${message}`);
+    }
+  }
+
+  /** After a failed generation, only some triggers try again (not every checkbox tick). */
+  private generationPausedFor(login: string): boolean {
+    if (
+      this.previousStatus?.state === 'error' &&
+      this.previousStatus.description.startsWith(GENERATION_ERROR_PREFIX) &&
+      !RETRY_TRIGGERS.has(this.trigger.kind)
+    ) {
+      this.generationPaused = true;
+      log.info(`Not retrying quiz generation for ${login} on a ${this.trigger.kind} event after an earlier error.`);
+      return true;
+    }
+    return false;
   }
 
   /** A reviewer who used up all attempts cannot pass; an approval from them is not accepted. */
@@ -695,8 +1196,29 @@ class Reconciliation {
         log.warning(`Could not dismiss review ${review.id}: ${(error as Error).message}`);
       }
     }
-    const last = this.quizzesOf(login).at(-1);
+    const last = this.quizzesOf(login)
+      .filter((q) => !q.state.challenge)
+      .at(-1);
     const note = `${who} has used all ${this.config.maxAttempts} attempts; no new quiz will be generated. Another reviewer needs to approve and pass.`;
+    if (last && !last.state.closingNotes?.includes(note)) {
+      last.state.closingNotes = [...(last.state.closingNotes ?? []), note];
+      await this.save(last);
+      this.record('attempts-exhausted', note);
+    }
+  }
+
+  /** A challenged author without attempts left stays blocked; nothing is dismissed. */
+  private async lockOutChallenge(login: string): Promise<void> {
+    const who = mention(login);
+    const n = this.config.maxAttempts;
+    const by = this.challengersOf(login);
+    const withdraw = by.length === 1 ? `${listLogins(by)} can withdraw the challenge` : `${listLogins(by)} can withdraw their challenges`;
+    const note =
+      `${who} has used all ${n} attempts on this challenge, so no new quiz is generated. ` +
+      `A reviewer can comment \`${this.config.command} challenge ${who}\` for ${n} new attempts, or ${withdraw}.`;
+    const last = this.quizzesOf(login)
+      .filter((q) => q.state.challenge)
+      .at(-1);
     if (last && !last.state.closingNotes?.includes(note)) {
       last.state.closingNotes = [...(last.state.closingNotes ?? []), note];
       await this.save(last);
@@ -719,9 +1241,9 @@ class Reconciliation {
     return contents;
   }
 
-  private async createQuiz(login: string, practice: boolean): Promise<void> {
+  private async createQuiz(login: string, kind: QuizKind): Promise<void> {
     const lastPass = this.quizzesOf(login)
-      .filter((q) => q.state.status === 'passed')
+      .filter((q) => q.state.status === 'passed' && quizKind(q.state) === kind)
       .at(-1);
     const changed = lastPass ? changedSince(lastPass.state.files, this.changes) : null;
     const scoped = changed ? new Set(changed.filter((p) => p in this.changes.fileFingerprints)) : undefined;
@@ -745,7 +1267,12 @@ class Reconciliation {
       );
     }
 
-    const history = this.attemptHistory(login);
+    const history = this.attemptHistory(login, kind === 'challenge' ? 'challenge' : 'other');
+    // A backup of the challenges this quiz answers, in case their records are lost.
+    const refs: ChallengeRef[] | undefined =
+      kind === 'challenge'
+        ? this.activeChallenges(login).map(({ id, by, at, commandCommentId }) => ({ id, by, at, commandCommentId }))
+        : undefined;
     const generated = await generateQuiz(this.deps.llm, {
       context: context.text,
       reviewer: login,
@@ -755,6 +1282,8 @@ class Reconciliation {
       incremental,
       extraInstructions: this.config.extraInstructions,
       verify: this.config.verifyQuestions,
+      audience: kind === 'review' ? 'reviewer' : 'author',
+      challengers: kind === 'challenge' ? this.challengersOf(login) : undefined,
     });
 
     const fileCount = Object.keys(this.changes.fileFingerprints).length;
@@ -769,7 +1298,8 @@ class Reconciliation {
       fingerprint: this.changes.fingerprint,
       files: fileCount <= MAX_STORED_FILE_FINGERPRINTS ? this.changes.fileFingerprints : undefined,
       scope: incremental ? 'incremental' : 'full',
-      practice: practice || undefined,
+      practice: kind === 'practice' || undefined,
+      challenge: refs ? { refs } : undefined,
       attested: true,
       status: 'open',
       questions: generated.questions,
@@ -780,7 +1310,8 @@ class Reconciliation {
     const verified = this.config.verifyQuestions ? `, ${generated.verifiedCount} verified, ${generated.droppedCount} dropped` : '';
     this.record(
       'quiz-posted',
-      `Quiz for ${mention(login)} (attempt ${state.attempt}, ${state.scope}, ${state.questions.length} questions${verified}): ${quiz.url}`,
+      `${kind === 'challenge' ? 'Challenge quiz' : 'Quiz'} for ${mention(login)} (attempt ${state.attempt}, ${state.scope}, ` +
+        `${state.questions.length} questions${verified}): ${quiz.url}`,
     );
   }
 
@@ -801,13 +1332,17 @@ class Reconciliation {
     const passers = this.passes();
     const pendingApprovers = eligibleApprovers.filter((login) => this.passStatus(login).status !== 'valid');
     const open = this.openQuizzes();
+    // Reviewers alone: every active challenge is required on top, however `require-all-approvers` is set.
     const satisfied = passers.length > 0 && (!this.config.requireAllApprovers || pendingApprovers.length === 0);
+    const unmet = this.unmetChallengees();
+    const passedBy = `Passed by ${listLogins(passers.map((q) => q.state.reviewer))}`;
 
-    if (satisfied) {
+    if (satisfied && !unmet.length && !this.challengesUnverified) {
+      const met = this.challengees();
       return {
         state: 'success',
         context,
-        description: `Passed by ${listLogins(passers.map((q) => q.state.reviewer))}`,
+        description: met.length ? `${passedBy}; challenge passed by ${listLogins(met)}` : passedBy,
         target_url: passers.at(-1)!.url,
       };
     }
@@ -823,16 +1358,39 @@ class Reconciliation {
       return {
         state: 'error',
         context,
-        description: 'Could not verify a quiz (GitHub API error); it is checked again on the next event.',
+        description: 'Could not verify a quiz or challenge (GitHub API error); it is checked again on the next event.',
         target_url: this.pr.html_url,
       };
     }
     if (open.length) {
+      const takers = open.map((q) => `${mention(q.state.reviewer)}${q.state.challenge ? ' (challenged)' : ''}`);
       return {
         state: 'pending',
         context,
-        description: `Waiting for ${listLogins(open.map((q) => q.state.reviewer))} to answer the quiz`,
+        description: `Waiting for ${joinList(takers)} to answer the quiz`,
         target_url: open[0]!.url,
+      };
+    }
+    const locked = unmet.filter((login) => this.lockedOut(login));
+    if (locked.length) {
+      return {
+        state: 'pending',
+        context,
+        description:
+          `${listLogins(locked)} used all ${this.config.maxAttempts} challenge attempts; ` +
+          `a reviewer can comment "${this.config.command} challenge ${locked.map(mention).join(' ')}" for more`,
+        target_url:
+          this.quizzesOf(locked[0]!)
+            .filter((q) => q.state.challenge)
+            .at(-1)?.url ?? this.pr.html_url,
+      };
+    }
+    if (satisfied) {
+      return {
+        state: 'pending',
+        context,
+        description: `${passedBy}; waiting for a challenge quiz for ${listLogins(unmet)}`,
+        target_url: this.pr.html_url,
       };
     }
     const reapprove = [...new Set(this.quizzes.map((q) => q.state.reviewer))].filter(
@@ -851,6 +1409,14 @@ class Reconciliation {
         state: 'pending',
         context,
         description: `Approval by ${listLogins(pendingApprovers)} is not backed by a passed quiz`,
+        target_url: this.pr.html_url,
+      };
+    }
+    if (unmet.length) {
+      return {
+        state: 'pending',
+        context,
+        description: `Waiting for a challenge quiz for ${listLogins(unmet)}`,
         target_url: this.pr.html_url,
       };
     }
@@ -877,11 +1443,17 @@ class Reconciliation {
     this.record('status', `${status.context}: ${status.state} (${description})`);
   }
 
-  /** Steps 4 and 9 of the flow: the bot blocks while a quiz is pending and approves once the gate passes. */
+  /**
+   * Steps 4 and 9 of the flow: the bot blocks while a quiz is pending or a challenge is unmet (even when it can't
+   * be generated or the author has no attempts left) and approves once the gate passes.
+   */
   private async syncBotReview(satisfied: boolean): Promise<void> {
     const botReviews = this.reviews.filter((r) => r.user?.type === 'Bot' && (r.body ?? '').includes(REVIEW_MARKER));
     const latest = botReviews.filter((r) => r.state !== 'COMMENTED').at(-1);
     const open = this.openQuizzes();
+    const unmet = this.unmetChallengees();
+    const blocking = open.length > 0 || unmet.length > 0;
+    const challengedBy = (login: string) => listLogins(this.challengersOf(login)) || 'a reviewer';
     const passes = this.passes();
     const passers = passes.map((q) => q.state.reviewer);
     const sha = this.pr.head.sha;
@@ -896,7 +1468,10 @@ class Reconciliation {
       const attested = passes.every((q) => q.state.attested)
         ? ` ${passers.length === 1 ? 'The reviewer' : 'Each reviewer'} confirmed answering from their own reading of the code, not by asking an AI.`
         : '';
-      const body = `${REVIEW_MARKER}\n✅ **PR Quiz passed** by ${listLogins(passers)}: every question about this change was answered correctly, so the approval is backed by understanding.${attested}`;
+      const challenges = this.challengees()
+        .map((login) => ` ${mention(login)} also passed the challenge by ${challengedBy(login)}.`)
+        .join('');
+      const body = `${REVIEW_MARKER}\n✅ **PR Quiz passed** by ${listLogins(passers)}: every question about this change was answered correctly, so the approval is backed by understanding.${attested}${challenges}`;
       try {
         await this.gh.createReview(this.prNumber, 'APPROVE', body, sha);
         this.record('bot-approved', `Approved on behalf of ${listLogins(passers)}.`);
@@ -907,11 +1482,23 @@ class Reconciliation {
       return;
     }
 
-    if (open.length && latest?.state !== 'CHANGES_REQUESTED') {
-      const links = open.map((q) => `- ${mention(q.state.reviewer)}: ${q.url}`).join('\n');
+    if (blocking && latest?.state !== 'CHANGES_REQUESTED') {
+      const waiting = open.map(
+        (q) =>
+          `- ${mention(q.state.reviewer)}${q.state.challenge ? ` (challenged by ${challengedBy(q.state.reviewer)})` : ''}: ${q.url}`,
+      );
+      for (const login of unmet) {
+        if (open.some((q) => loginsEqual(q.state.reviewer, login))) continue;
+        waiting.push(
+          this.lockedOut(login)
+            ? `- ${mention(login)}: used all ${this.config.maxAttempts} attempts on the challenge by ${challengedBy(login)}`
+            : `- ${mention(login)}: challenge quiz by ${challengedBy(login)} not posted yet`,
+        );
+      }
+      const challenged = this.activeChallenges().length ? ' Challenged authors must pass their own quiz too.' : '';
       const body =
-        `${REVIEW_MARKER}\n🧠 **PR Quiz pending.** An approval counts once the reviewer answers a few questions about this change correctly.\n\n` +
-        `Waiting for:\n${links}`;
+        `${REVIEW_MARKER}\n🧠 **PR Quiz pending.** An approval counts once the reviewer answers a few questions about this change correctly.${challenged}\n\n` +
+        `Waiting for:\n${waiting.join('\n')}`;
       try {
         await this.gh.createReview(this.prNumber, 'REQUEST_CHANGES', body, sha);
         this.record('bot-requested-changes', 'Blocking until the quiz is passed.');
@@ -921,7 +1508,7 @@ class Reconciliation {
       return;
     }
 
-    if (!open.length && latest?.state === 'APPROVED') {
+    if (!blocking && latest?.state === 'APPROVED') {
       await this.dismissBotReview(latest, 'PR Quiz: the approval is no longer backed by a passed quiz.');
     }
   }

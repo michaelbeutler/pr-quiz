@@ -193,7 +193,7 @@ export function renderPullRequestContext(pr: PullRequestInfo, changes: ChangeSet
   }
   if (options.onlyPaths) {
     lines.push(
-      '<pq_scope>The reviewer already passed a quiz on an earlier version of this pull request. ' +
+      '<pq_scope>The person taking this quiz already passed a quiz on an earlier version of this pull request. ' +
         'The diff below only contains the files that changed since then.</pq_scope>',
     );
   }

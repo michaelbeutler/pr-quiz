@@ -1,5 +1,8 @@
+import { isCommand, parseCommand } from './command.ts';
 import { QUIZ_MARKER } from './quiz/render.ts';
 import type { Trigger } from './reconcile.ts';
+
+export { isCommand } from './command.ts';
 
 interface EventUser {
   login?: string;
@@ -21,14 +24,6 @@ export interface ParsedEvent {
   trigger?: Trigger;
   /** Set when the event needs no work. */
   skipReason?: string;
-}
-
-function escapeRegExp(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
-export function isCommand(body: string | undefined, command: string): boolean {
-  return new RegExp(`^\\s*${escapeRegExp(command)}(?:\\s|$)`, 'i').test(body ?? '');
 }
 
 export function parseEvent(eventName: string, raw: unknown, command: string): ParsedEvent {
@@ -60,9 +55,16 @@ export function parseEvent(eventName: string, raw: unknown, command: string): Pa
       if (payload.sender?.type === 'Bot') return { prNumber, skipReason: 'the comment event was caused by a bot.' };
       const body = payload.comment?.body ?? '';
       if (payload.action === 'created' && isCommand(body, command)) {
+        const parsed = parseCommand(body, command);
         return {
           prNumber,
-          trigger: { kind: 'command', actor: payload.comment?.user?.login, commandCommentId: payload.comment?.id },
+          trigger: {
+            kind: 'command',
+            actor: payload.comment?.user?.login,
+            commandCommentId: payload.comment?.id,
+            // A plain request keeps the trigger it always had.
+            ...(parsed && parsed.verb !== 'quiz' ? { command: parsed } : {}),
+          },
         };
       }
       if ((payload.action === 'edited' || payload.action === 'deleted') && body.includes(QUIZ_MARKER)) {

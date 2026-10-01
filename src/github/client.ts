@@ -26,6 +26,8 @@ export interface RestGitHubOptions {
 const MAX_RETRIES = 3;
 /** 20 pages of 50 revisions; longer histories are reported as incomplete. */
 const MAX_EDIT_PAGES = 20;
+/** 50 pages of 100 reviews. */
+const MAX_REVIEW_PAGES = 50;
 
 /** Small fetch-based GitHub client (REST + GraphQL) with pagination and retries for transient errors. */
 export class RestGitHub implements GitHubApi {
@@ -179,6 +181,10 @@ export class RestGitHub implements GitHubApi {
     ).data;
   }
 
+  async updateReview(pr: number, reviewId: number, body: string): Promise<Review> {
+    return (await this.request<Review>('PUT', `${this.repoPath}/pulls/${pr}/reviews/${reviewId}`, { body })).data;
+  }
+
   async dismissReview(pr: number, reviewId: number, message: string): Promise<void> {
     await this.request('PUT', `${this.repoPath}/pulls/${pr}/reviews/${reviewId}/dismissals`, {
       message,
@@ -211,14 +217,15 @@ export class RestGitHub implements GitHubApi {
 
   async getCommentEdits(commentNodeId: string): Promise<CommentHistory> {
     // `diff` holds the full body of each revision (verified against GitHub), `deletedAt` marks pruned revisions.
+    // Issue comments and pull request reviews both have the field, so it is selected on each.
+    const selection = `userContentEdits(first: 50, after: $after) {
+      pageInfo { hasNextPage endCursor }
+      nodes { editedAt deletedAt diff editor { login __typename } }
+    }`;
     const query = `query($id: ID!, $after: String) {
       node(id: $id) {
-        ... on IssueComment {
-          userContentEdits(first: 50, after: $after) {
-            pageInfo { hasNextPage endCursor }
-            nodes { editedAt deletedAt diff editor { login __typename } }
-          }
-        }
+        ... on IssueComment { ${selection} }
+        ... on PullRequestReview { ${selection} }
       }
     }`;
     type Page = {
@@ -253,6 +260,41 @@ export class RestGitHub implements GitHubApi {
       after = connection.pageInfo.endCursor;
     }
     return { edits, complete: false };
+  }
+
+  async listEditedReviewIds(pr: number): Promise<Set<number>> {
+    // REST shows no trace of an edited review body; GraphQL's `lastEditedAt` does.
+    const query = `query($owner: String!, $repo: String!, $pr: Int!, $after: String) {
+      repository(owner: $owner, name: $repo) {
+        pullRequest(number: $pr) {
+          reviews(first: 100, after: $after) {
+            pageInfo { hasNextPage endCursor }
+            nodes { databaseId lastEditedAt }
+          }
+        }
+      }
+    }`;
+    type Page = {
+      repository: {
+        pullRequest: {
+          reviews: {
+            pageInfo: { hasNextPage: boolean; endCursor: string | null };
+            nodes: Array<{ databaseId: number | null; lastEditedAt: string | null } | null>;
+          };
+        } | null;
+      } | null;
+    };
+    const ids = new Set<number>();
+    let after: string | null = null;
+    for (let page = 0; page < MAX_REVIEW_PAGES; page++) {
+      const data: Page = await this.graphql<Page>(query, { owner: this.opts.owner, repo: this.opts.repo, pr, after });
+      const reviews = data.repository?.pullRequest?.reviews;
+      if (!reviews) throw new GitHubError(`GitHub GraphQL found no pull request #${pr} in ${this.opts.owner}/${this.opts.repo}`, 404);
+      for (const node of reviews.nodes) if (node?.databaseId && node.lastEditedAt) ids.add(node.databaseId);
+      if (!reviews.pageInfo.hasNextPage) return ids;
+      after = reviews.pageInfo.endCursor;
+    }
+    throw new GitHubError(`Pull request #${pr} has more than ${MAX_REVIEW_PAGES * 100} reviews; their edits were not checked`, 200);
   }
 
   async hasWriteAccess(login: string): Promise<boolean> {

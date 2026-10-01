@@ -25,10 +25,16 @@ async function step(title: string, trigger: Trigger, before?: () => void): Promi
   console.log(dim(`  bot review: ${gh.botReviewState() ?? 'none'} · alice's review: ${gh.reviewStateOf('alice') ?? 'none'}`));
 }
 
-function show(commentId: number): void {
-  const body = gh.comments.find((c) => c.id === commentId)!.body.replace(/\r\n/g, '\n');
-  const pretty = body.replace(/<!-- pr-quiz:state:[\w-]+ -->/, '<!-- pr-quiz:state:<encrypted answer key> -->');
+function print(body: string): void {
+  const pretty = body
+    .replace(/\r\n/g, '\n')
+    .replace(/<!-- pr-quiz:state:[\w-]+ -->/, '<!-- pr-quiz:state:<encrypted answer key> -->')
+    .replace(/<!-- pr-quiz:challenge-state:[\w-]+ -->/, '<!-- pr-quiz:challenge-state:<encrypted challenge record> -->');
   console.log(pretty.split('\n').map((line) => `  │ ${line}`).join('\n'));
+}
+
+function show(commentId: number): void {
+  print(gh.comments.find((c) => c.id === commentId)!.body);
 }
 
 await step('1. @author opens pull request #7', { kind: 'push', actor: 'author' });
@@ -52,3 +58,20 @@ await step('8. @alice answers every question correctly', { kind: 'comment-edit',
 );
 console.log(bold('\n9. The bot approved. Final quiz comment:'));
 show(quiz2.id);
+
+const challenge = gh.say('alice', '/pr-quiz challenge');
+await step('10. @alice challenges @author: "/pr-quiz challenge"', {
+  kind: 'command',
+  actor: 'alice',
+  commandCommentId: challenge.id,
+  command: { verb: 'challenge', targets: [] },
+});
+console.log(bold('\nThe bot recorded the challenge in a comment review that only @alice can withdraw:'));
+print(gh.challengeReviews()[0]!.body!);
+const challengeQuiz = gh.latestQuizFor('author')!;
+console.log(bold('\n@author got a quiz of their own; the gate waits for it although @alice passed:'));
+show(challengeQuiz.id);
+
+await step('11. @author answers every question correctly', { kind: 'comment-edit', actor: 'author' }, () =>
+  gh.answerQuiz('author', challengeQuiz.id, pickRight),
+);
