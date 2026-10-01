@@ -82,6 +82,8 @@ describe('RestGitHub', () => {
       '/pulls/7/commits': [
         { author: { login: 'dev' }, committer: { login: 'web-flow' } },
         { author: null, committer: { login: 'bob' } },
+        // "Update branch" merges the base branch in; that doesn't make the clicker an author.
+        { author: { login: 'maintainer' }, committer: { login: 'web-flow' }, parents: [{ sha: 'a' }, { sha: 'b' }] },
       ],
     });
     expect((await gh.listCommitters(7)).sort()).toEqual(['bob', 'dev', 'web-flow']);

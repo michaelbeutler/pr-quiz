@@ -291,12 +291,14 @@ describe('limits and permissions', () => {
     expect(gh.latestStatus()?.state).toBe('pending');
   });
 
-  it('lets reviewers request a quiz with the command, but not the author or read-only users', async () => {
+  it('lets anyone with write access request a quiz with the command, but not read-only users', async () => {
     const { gh, run } = setup();
     gh.permissions.set('reader', 'read');
     const own = gh.say('author', '/pr-quiz');
     await run({ kind: 'command', actor: 'author', commandCommentId: own.id });
-    expect(gh.reactions).toContainEqual({ commentId: own.id, content: 'confused' });
+    expect(gh.reactions).toContainEqual({ commentId: own.id, content: 'rocket' });
+    gh.answerQuiz('author', gh.latestQuizFor('author')!.id, pickRight);
+    expect((await run()).gate).toBe('pending'); // the author's own pass is practice only
 
     const reader = gh.say('reader', '/pr-quiz');
     await run({ kind: 'command', actor: 'reader', commandCommentId: reader.id });
@@ -582,19 +584,49 @@ describe('changes a quiz cannot cover', () => {
 });
 
 describe('who may take the quiz', () => {
-  it('excludes people who committed to the pull request, and ignores their approvals', async () => {
-    const { gh, run } = setup();
+  it('gives people who committed to the pull request only a practice quiz, and ignores their approvals', async () => {
+    const { gh, run, llm } = setup();
     gh.push(sampleFiles(2), 'bob'); // bob pushed a fix-up commit
     gh.approve('bob');
+    await run();
+    expect(gh.latestQuizFor('bob')).toBeUndefined(); // his approval alone doesn't start a quiz
+    expect(llm.requests).toHaveLength(0);
+
     const own = gh.say('bob', '/pr-quiz');
     await run({ kind: 'command', actor: 'bob', commandCommentId: own.id });
-    expect(gh.latestQuizFor('bob')).toBeUndefined();
-    expect(gh.reactions).toContainEqual({ commentId: own.id, content: 'confused' });
+    expect(gh.reactions).toContainEqual({ commentId: own.id, content: 'rocket' });
+    expect(gh.latestQuizFor('bob')!.body).toContain('practice quiz');
+    expect(gh.latestStatus()?.description).not.toContain('@bob'); // the gate doesn't wait for practice
+    expect(gh.botReviewState()).toBeUndefined();
+
+    gh.answerQuiz('bob', gh.latestQuizFor('bob')!.id, pickRight);
+    expect((await run()).gate).toBe('pending');
+    expect(gh.latestQuizFor('bob')!.body).toContain('does not count toward the gate');
 
     gh.approve('alice');
     await run();
     gh.answerQuiz('alice', gh.latestQuizFor('alice')!.id, pickRight);
     expect((await run()).gate).toBe('passed');
+  });
+
+  it('does not dismiss or re-request anything when a practice quiz fails, and retakes only on request', async () => {
+    const { gh, run } = setup();
+    gh.push(sampleFiles(2), 'bob');
+    gh.approve('bob');
+    const own = gh.say('bob', '/pr-quiz');
+    await run({ kind: 'command', actor: 'bob', commandCommentId: own.id });
+    const first = gh.latestQuizFor('bob')!;
+    gh.answerQuiz('bob', first.id, pickWrongFirst);
+    const result = await run();
+    expect(result.actions.map((a) => a.type)).not.toContain('approval-dismissed');
+    expect(gh.requested).toEqual([]);
+    expect(gh.reviewStateOf('bob')).toBe('APPROVED');
+    expect(gh.latestQuizFor('bob')!.id).toBe(first.id); // no automatic retake
+    expect(gh.bodyOf(first.id)).toContain('`/pr-quiz` for new questions');
+
+    const again = gh.say('bob', '/pr-quiz');
+    await run({ kind: 'command', actor: 'bob', commandCommentId: again.id });
+    expect(gh.latestQuizFor('bob')!.id).not.toBe(first.id);
   });
 
   it('stops counting a pass when the reviewer later pushes to the pull request', async () => {
